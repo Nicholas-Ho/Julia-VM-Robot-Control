@@ -59,7 +59,7 @@ struct ROSPyClientConnection
     # config
     num_torques::Int
     num_states::Int
-    num_data::Int  # Serialised data
+    num_targets::Int  # Serialised data
     # Sockets
     command_socket::TCPSocket
     data_socket::UDPSocket
@@ -78,7 +78,7 @@ struct ROSPyClientConnection
             command_socket::TCPSocket,
             num_torques::Int,
             num_states::Int,
-            num_data::Int
+            num_targets::Int
         )
         # Bind the data socket to the same address as the command socket
         @assert isopen(command_socket)
@@ -86,7 +86,7 @@ struct ROSPyClientConnection
         data_socket = UDPSocket()
         bind(data_socket, bound_ip, bound_port)
         # Each "target" is a 3D position (x,y,z)
-        status = ROSPyConnectionStatus(0, 0, 0, RobotStatePacket(0, 0, zeros(num_states)), TargetPosPacket(zeros(num_data)))
+        status = ROSPyConnectionStatus(0, 0, 0, RobotStatePacket(0, 0, zeros(num_states)), TargetPosPacket(zeros(5*num_targets)))
         # Start a task to receive commands on the tcp socket
         stop = Threads.Atomic{Bool}(false)
         recv_tcp_lock = ReentrantLock()
@@ -118,7 +118,7 @@ struct ROSPyClientConnection
         new(
             num_torques,
             num_states,
-            num_data, # Not sure what exactly is this
+            num_targets, # Not sure what exactly is this
             command_socket,
             data_socket,
             status,
@@ -159,9 +159,9 @@ function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::V
     nothing
 end
 
-function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, num_data::Int)
+function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, num_targets::Int)
     command_socket = connect(rospy_ip, rospy_port)
-    ROSPyClientConnection(command_socket, num_torques, num_states, num_data)
+    ROSPyClientConnection(command_socket, num_torques, num_states, num_targets)
 end
 
 function _cleanup!(connection::ROSPyClientConnection)
@@ -182,8 +182,8 @@ function _cleanup!(connection::ROSPyClientConnection)
     connection
 end
 
-function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, num_data::Int)
-    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, num_data)
+function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, num_targets::Int)
+    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, num_targets)
     try
         f(connection)
     finally
@@ -451,7 +451,7 @@ end
 cvms = compile(vms)
 
 qᵛ = Float64[]
-with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, 5) do connection
+with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, 1) do connection
     ros_vm_controller(connection, cvms, qᵛ; f_control, f_setup, E_max=30.0)
 end
 
