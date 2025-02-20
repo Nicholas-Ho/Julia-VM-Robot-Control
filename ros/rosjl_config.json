@@ -1,0 +1,34 @@
+{
+    "listen_port": 25342,
+    "listen_ip": "127.0.0.1",
+    "rate": 100,
+    "auto_restart": true,
+    "ros": {
+        "control": {
+            "joint_commands": {
+                "topic": "/joint_commands",
+                "size": 7
+            },
+            "joint_states": {
+                "topic": "/joint_states"
+            }
+        },
+        "data": {
+            "subscriber": [
+                {
+                    "id": 1,
+                    "topic": "/target_data",
+                    "data_point_size": 5,
+                    "data_points": 1
+                }
+            ],
+            "publisher": [
+                {
+                    "topic": "/joint_cartesian",
+                    "data_point_size": 3,
+                    "data_points": 8
+                }
+            ]
+        }
+    }
+}

@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 # coding: utf-8
 import argparse
+import json
 import errno
 import ipaddress
 import socket
@@ -15,40 +16,43 @@ import rospy
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 from sensor_msgs.msg import JointState
+from collections import deque, namedtuple
+from typing import Deque, Dict
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+DataSubscriberInfo = namedtuple('DataSubscriberInfo', ['topic', 'size'])
+MsgInfo = namedtuple('MsgInfo', ['type', 'msg'])
 
 class ROSManager:
-    subscriber_topic = None
-    publisher_topic = None
-    targets_subscriber_topic = None
+    control_subscriber_topic = None
+    control_publisher_topic = None
+    data_subscriber_topics = []
     joint_command_size = None
     joint_state_size = None
-    targets_size = None
+    data_sizes = []
     publisher = None
     joint_command_message = None
     rate = None
-    new_msg_available = False
-    new_msg = None
-    new_targets_msg = None
+    new_msgs: Deque[MsgInfo] = deque()
 
-    def __init__(self, subscriber_topic, publisher_topic, targets_subscriber_topic, joint_command_size, joint_state_size, targets_size, targets_initial, rate):
+    def __init__(self,
+                 control_subscriber_topic,
+                 control_publisher_topic,
+                 joint_command_size,
+                 joint_state_size,
+                 data_subscriber_info: Dict[int, DataSubscriberInfo],
+                 rate):
         rospy.init_node('vmc_control')
-        self.subscriber_topic = subscriber_topic # Keeping it as it is for the joint state related messages
-        self.publisher_topic = publisher_topic
-        self.targets_subscriber_topic = targets_subscriber_topic
-        self.targets_size = targets_size
-        self.new_targets_msg = Float64MultiArray()
-        self.new_targets_msg.data = [float(num) for num in targets_initial]
+        self.rate = rospy.Rate(rate)
+
+        # Control messages
+        self.control_subscriber_topic = control_subscriber_topic
+        self.control_publisher_topic = control_publisher_topic
         self.joint_command_size = joint_command_size
         self.joint_state_size = joint_state_size
-        self.joint_sub = Subscriber(subscriber_topic, JointState)
-        rospy.Subscriber(subscriber_topic, JointState, self._subscriber_callback)
-        # self.targets_sub = Subscriber(targets_subscriber_topic, Float64MultiArray)
-        rospy.Subscriber(targets_subscriber_topic, Float64MultiArray, self._subscriber_callback_t)
-        # self.sync = ApproximateTimeSynchronizer([self.joint_sub, self.targets_sub], queue_size=100, slop=0.2, allow_headerless = True)
-        # self.sync.registerCallback(self._subscriber_callback)
-        self.publisher = rospy.Publisher(publisher_topic, Float64MultiArray, queue_size=1)
+        self.joint_sub = Subscriber(control_subscriber_topic, JointState)
+        rospy.Subscriber(control_subscriber_topic, JointState, self._control_subscriber_callback)
+        self.publisher = rospy.Publisher(control_publisher_topic, Float64MultiArray, queue_size=1)
         self.joint_command_message = Float64MultiArray()
         dim = MultiArrayDimension()
         dim.size = joint_command_size
@@ -56,27 +60,21 @@ class ROSManager:
         dim.label = "joint_effort"
         self.joint_command_message.layout.dim.append(dim)
         self.joint_command_message.data = [0.0] * joint_command_size
-        self.rate = rospy.Rate(rate)
 
-    # def _subscriber_callback(self, joint_msg, targets_msg):
-    #     assert self.joint_state_size%2 == 0 
-    #     assert len(joint_msg.position) == self.joint_state_size//2
-    #     assert len(joint_msg.velocity) == self.joint_state_size//2
-    #     assert len(targets_msg.data) == 3*self.targets_size
-    #     self.new_msg = joint_msg
-    #     self.new_targets_msg = targets_msg
+        # Data messages
+        self.data_subscriber_info = data_subscriber_info
+        for k, v in self.data_subscriber_info.items():
+            size = v.size
+            def f(self, msg):
+                assert len(msg.data) == size
+                self.new_msgs.append(MsgInfo(k, msg))
+            rospy.Subscriber(v.topic, Float64MultiArray, f)
 
-    def _subscriber_callback(self, joint_msg):
+    def _control_subscriber_callback(self, joint_msg):
         assert self.joint_state_size%2 == 0 
         assert len(joint_msg.position) == self.joint_state_size//2
         assert len(joint_msg.velocity) == self.joint_state_size//2
-        self.new_msg_available = True
-        self.new_msg = joint_msg
-
-    def _subscriber_callback_t(self, targets_msg):
-        assert len(targets_msg.data) == 5*self.targets_size
-        self.new_msg_available = True
-        self.new_targets_msg = targets_msg
+        self.new_msgs.append(MsgInfo(0, joint_msg))
 
         
 class JointCommand:
@@ -99,7 +97,7 @@ class IPCManager:
     listen_port = None
     joint_command_size = None
     joint_state_size = None
-    targets_size = None
+    data_sizes = []
     # Constants
     torque_fmt = None
     state_fmt = None
@@ -111,14 +109,17 @@ class IPCManager:
     state = None
     sequence_number = None
 
-    def __init__(self, listen_ip, listen_port, joint_command_size, joint_state_size, targets_size):
+    def __init__(self, listen_ip, listen_port, joint_command_size, joint_state_size, data_subscriber_info: Dict[int, DataSubscriberInfo]):
         self.listen_ip = listen_ip
         self.listen_port = listen_port
         self.joint_command_size = joint_command_size
         self.joint_state_size = joint_state_size
         # ! indicates network endianness, Q for unsigned 64 bit integer, d for 64 bit float
         self.torque_fmt = '!QQ' + 'd' * joint_command_size
-        self.state_fmt = '!QQ' + 'd' * (joint_state_size + 5*targets_size)
+        self.state_fmt = '!QQQ' + 'd' * joint_state_size
+        self.data_fmts = {}
+        for k, v in data_subscriber_info.items():
+            self.data_fmts[k] = '!QQQ' + 'd' * v.size
 
     def __enter__(self):
         #print("Waiting for connection")
@@ -191,13 +192,15 @@ class IPCManager:
             return None
         return command
 
-    def _send_robot_state(self, timestamp, sequence_number, joint_state_vector):
-        message = struct.pack(self.state_fmt, 
+    def send_data_to_julia(self, timestamp, data_type, data):
+        # Determine packet format. 0 is for joint states, otherwise format is from data_fmts (1-indexed)
+        fmt = self.state_fmt if data_type == 0 else self.data_fmts[data_type]
+        message = struct.pack(fmt, 
             timestamp, 
-            sequence_number, 
-            *joint_state_vector
+            self.sequence_number, 
+            data_type,
+            *data
         )
-        # I am keeping the variable name as joint_state_vector but it contains the targets positions
         # print(sequence_number)
         (remote_addr, remote_port) = self.command_socket.getpeername()
         result = self.send_data_socket.sendto(message, (remote_addr, remote_port))
@@ -205,11 +208,6 @@ class IPCManager:
         if result != len(message):
             print(f"Failed to send: Sent {result} bytes, expected {len(message)} bytes.")
             exit(1)
-
-    def send_robot_state(self, timestamp, joint_state_vector):
-        # print(f"Sending packet with sequence number {self.sequence_number}")
-        #print(timestamp)
-        self._send_robot_state(timestamp, self.sequence_number, joint_state_vector)
         self.sequence_number += 1
 
 
@@ -225,9 +223,11 @@ def loop_waiting(socket_manager):
             return STATE_WARMUP
         elif command == "":
             # Send state to julia every 100ms
-            if ros_manager.new_msg_available: # New msg received from ROS subscriber
-                forward_state_to_julia(socket_manager, ros_manager)
-                print("Sent initial state")
+            if len(ros_manager.new_msgs) > 0: # New msg received from ROS subscriber
+                msg_type = ros_manager.new_msgs[0].type
+                forward_data_to_julia(socket_manager, ros_manager)
+                if msg_type == 0:
+                    print("Sent initial state")
             else:
                 print("No state message received from ROS yet... retrying")
             time.sleep(0.5)
@@ -235,21 +235,25 @@ def loop_waiting(socket_manager):
             print(f"Unexpected command in state WAITING: \"{command}\".")
             return STATE_STOPPED
 
-def forward_state_to_julia(socket_manager, ros_manager):
-    msg_vec =  []
-    msg_vec.extend(ros_manager.new_msg.position)
-    msg_vec.extend(ros_manager.new_msg.velocity)
-    msg_vec.extend(ros_manager.new_targets_msg.data)
-    #print(msg_vec.new_msg.position)
-    # Messages are NOT cleared so that each subscriber callback will only overwrite the relevant topics
-    ros_manager.new_msg_available = False
-    socket_manager.send_robot_state(time.time_ns(), msg_vec) # Send to julia
+def forward_data_to_julia(socket_manager: IPCManager, ros_manager: ROSManager):
+    while len(ros_manager.new_msgs) > 0:
+        msg_info = ros_manager.new_msgs[0]
+        ros_manager.new_msgs.popleft()  # Clear the message
 
-def send_recv_send_recv_wait(socket_manager, ros_manager, set_zero=False):
+        msg_vec = []
+        if msg_info.type == 0:
+            # Joint states
+            msg_vec.extend(msg_info.msg.position)
+            msg_vec.extend(msg_info.msg.velocity)
+        else:
+            msg_vec = msg_info.data
+        socket_manager.send_data_to_julia(time.time_ns(), msg_info.type, msg_vec) # Send to julia
+
+def send_recv_send_recv_wait(socket_manager, ros_manager: ROSManager, set_zero=False):
     # print(ros_manager.new_msg.position)
     # print(ros_manager.new_targets_msg)
-    if ros_manager.new_msg_available: # New msg received from ROS subscriber
-        forward_state_to_julia(socket_manager, ros_manager)
+    if len(ros_manager.new_msgs) > 0: # New msgs received from ROS subscriber
+        forward_data_to_julia(socket_manager, ros_manager)
     command = socket_manager.recv_joint_command() 
     if command is not None: # New torque command received from julia
         if set_zero:
@@ -295,41 +299,46 @@ def loop_active(socket_manager, ros_manager):
 if __name__ == '__main__':
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument("joint_command_size", type=int)
-    parser.add_argument("joint_commands_topic", type=str)
-    parser.add_argument("joint_state_topic", type=str)
-    parser.add_argument("targets_state_topic", type=str)
-    parser.add_argument("--targets_size", type=int, required=True)
-    parser.add_argument('--targets_initial', nargs='+', required=True)
-    parser.add_argument("--rate", type=float, default=1000)
-    parser.add_argument("--joint_state_size", default=None)
-    parser.add_argument("--listen_port", type=int, default=25342)
-    parser.add_argument("--listen_ip", type=str, default="127.0.0.1")
-    parser.add_argument("--auto-restart", type=bool, default=True)
+    parser.add_argument("--config_file", type=str, required=True)
 
+    # Parse config file
+    config_file = parser.parse_args().config_file
+    with open(config_file) as f:
+        cfg = json.load(f)
 
-    args = parser.parse_args()
-    joint_command_size = args.joint_command_size
-    joint_state_size = args.joint_state_size if args.joint_state_size is not None else 2 * joint_command_size
-    joint_commands_topic = args.joint_commands_topic
-    targets_state_topic = args.targets_state_topic
-    joint_state_topic = args.joint_state_topic
-    targets_size = args.targets_size
-    targets_initial = args.targets_initial
-    listen_port = args.listen_port
-    listen_ip = ipaddress.ip_address(args.listen_ip)
+    # Extract relevant parameters
+    joint_command_size = cfg["ros"]["control"]["joint_commands"]["size"]
+    try:
+        joint_state_size = cfg["ros"]["control"]["joint_states"]["size"]
+    except:
+        joint_state_size = 2 * joint_command_size
+    joint_commands_topic = cfg["ros"]["control"]["joint_commands"]["topic"]
+    joint_state_topic = cfg["ros"]["control"]["joint_states"]["topic"]
+
+    # Handle multiple topics via different packets (and sizes)
+    data_subscriber_info = {}
+    for entry in cfg["ros"]["data"]["subscriber"]:
+        if entry["id"] == 0:
+            raise Exception("The subscriber index 0 is reserved for control messages")
+        data_subscriber_info[entry["id"]] = \
+            DataSubscriberInfo(entry["topic"],
+                               entry["data_point_size"] * entry["data_points"])
+
+    # Network config
+    listen_port = cfg["listen_port"] if "listen_port" in cfg else 25342
+    listen_ip = ipaddress.ip_address(cfg["listen_ip"] if "listen_ip" in cfg else "127.0.0.1")
+    auto_restart = cfg["auto_restart"] if "auto_restart" in cfg else True
+    rate = cfg["rate"] if "rate" in cfg else 1000
 
     # Setup ROS
     # rospy.init_node('vmc_control')
     ros_manager = ROSManager(
         joint_state_topic,
         joint_commands_topic,
-        targets_state_topic,
         joint_command_size,
         joint_state_size,
-        targets_size,
-        targets_initial,
-        args.rate
+        data_subscriber_info,
+        rate
     )
 
     # Communication with Julia
@@ -338,7 +347,7 @@ if __name__ == '__main__':
         listen_port,
         joint_command_size,
         joint_state_size,
-        targets_size    
+        data_subscriber_info    
     )
 
     while not rospy.is_shutdown():
@@ -359,8 +368,8 @@ if __name__ == '__main__':
                 except Exception as e:
                     print(f"Unhandled Exception: {e}")
                     # time.sleep(0.2)
-                if not args.auto_restart:
+                if not auto_restart:
                     break
-        if not args.auto_restart:
+        if not auto_restart:
             break
 
