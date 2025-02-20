@@ -20,6 +20,8 @@ using VMRobotControl:
     DEFAULT_F_CONTROL,
     robot_ndof
 
+using VMRobotControl: remake
+
 ROSPY_LISTEN_PORT = 25342
 
 const START = "START"
@@ -370,7 +372,7 @@ function ros_vm_controller(
         NDOF = robot_ndof(control_cache)
         qʳ = view(state.state, 1:NDOF)
         q̇ʳ = zeros(eltype(control_cache), NDOF)
-        target_positions_ = view(target_positions.target_pos, 1:9)
+        target_positions_ = view(target_positions.target_pos, 1:5)
         control_step!(control_cache, 0.0, qʳ, q̇ʳ) # Step at t=0 to set initial state
     end
     
@@ -383,7 +385,7 @@ function ros_vm_controller(
             @assert length(state) == 2*NDOF
             qʳ = view(state, 1:NDOF)
             q̇ʳ = view(state, NDOF+1:2*NDOF)
-            target_positions_ = view(target_positions, 1:9) # 3 targets with 3 dimensions each (x,y,z)
+            target_positions_ = view(target_positions, 1:5) # 1 target with 3 dimensions each (x,y,z) and 2 mechanism constants
             # Main control step
             f_control(control_cache, target_positions_, t, args, (dt, i)) # Call user control function
             torques .= control_step!(control_cache, t, qʳ, q̇ʳ) # Get torques
@@ -421,7 +423,7 @@ for (i, τ_coulomb) in zip(1:7, [5.0, 5.0, 5.0, 5.0, 3.0, 3.0, 3.0])
     add_component!(robot, TanhDamper(τ_coulomb, β, "J$i");         id="JointDamper$i")
 end;
 
-add_coordinate!(robot, FramePoint("panda_hand", SVector(0., 0., 0)); id="EndEffector")
+add_coordinate!(robot, FramePoint("panda_hand_tcp", SVector(0., 0., 0)); id="EndEffector")
 
 vms = VirtualMechanismSystem("RobotProgramming", robot)
 vm = vms.virtual_mechanism
@@ -435,16 +437,20 @@ add_component!(vms, LinearDamper(10.0, "EE pos error"); id="EE_damper")
 
 function f_setup(cache)
     EndEffector_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
-    EE_spring_id = get_compiled_coordID(cache, ".virtual_mechanism.EE_spring")
-    EE_damper_id = get_compiled_coordID(cahce, ".virtual_mechanism.EE_damper")
+    EE_spring_id = get_compiled_componentID(cache, "EE_spring")
+    EE_damper_id = get_compiled_componentID(cache, "EE_damper")
     return (EndEffector_coord_id, EE_spring_id, EE_damper_id)
 end
 
 function f_control(cache, target_positions, t, setup_ret, extra)
     EndEffector_coord_id, EE_spring_id, EE_damper_id = setup_ret
-    EndEffector_coord_id = cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
-    EE_spring_id = cache[EE_spring_id].stiffness = target_positions[5]
-    EE_damper_id = cache[EE_damper_id].damping = target_positions[5]
+    cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
+    if cache[EE_spring_id].stiffness != target_positions[4]
+        cache[EE_spring_id] = remake(cache[EE_spring_id]; stiffness=target_positions[4])
+    end
+    if cache[EE_damper_id].damping != target_positions[5]
+        cache[EE_damper_id] = remake(cache[EE_damper_id]; damping=target_positions[5])
+    end
     nothing 
 end
 
