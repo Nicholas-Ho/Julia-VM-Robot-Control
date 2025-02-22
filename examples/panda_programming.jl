@@ -153,13 +153,17 @@ end
 
 function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::Vector{UInt8}, data_sizes::Dict{Uint64, Uint64})
     Base.@lock status_lock begin
+        # Initial check
+        expected_length = sizeof(UInt64) + sizeof(UInt64) + sizeof(Uint64)
+        if length(data) < expected_length
+            error("Invalid rospy data packet length: packet smaller than expected metadata")
+        end
         # Start reading
         b = IOBuffer(data; read=true, write=false)
         timestamp = ntoh(read(b, UInt64))
         # Check type of data
         data_type = ntoh(read(b, Uint64))
         # Check for valid length
-        expected_length = sizeof(UInt64) + sizeof(UInt64) + sizeof(Uint64)
         if data_type == 0
             expected_length += length(status.last_state_received.state) * sizeof(Float64)
         else
