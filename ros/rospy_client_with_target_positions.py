@@ -16,12 +16,11 @@ import rospy
 from message_filters import Subscriber, ApproximateTimeSynchronizer
 from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 from sensor_msgs.msg import JointState
-from collections import deque, namedtuple
-from typing import Deque, Dict
+from collections import namedtuple
+from typing import Dict
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 DataSubscriberInfo = namedtuple('DataSubscriberInfo', ['topic', 'size'])
-MsgInfo = namedtuple('MsgInfo', ['type', 'msg'])
 
 class ROSManager:
     control_subscriber_topic = None
@@ -33,7 +32,7 @@ class ROSManager:
     publisher = None
     joint_command_message = None
     rate = None
-    new_msgs: Deque[MsgInfo] = deque()
+    new_msgs = {}
 
     def __init__(self,
                  control_subscriber_topic,
@@ -67,14 +66,14 @@ class ROSManager:
             size = v.size
             def f(self, msg):
                 assert len(msg.data) == size
-                self.new_msgs.append(MsgInfo(k, msg))
+                self.new_msgs[k] = msg
             rospy.Subscriber(v.topic, Float64MultiArray, f)
 
     def _control_subscriber_callback(self, joint_msg):
         assert self.joint_state_size%2 == 0 
         assert len(joint_msg.position) == self.joint_state_size//2
         assert len(joint_msg.velocity) == self.joint_state_size//2
-        self.new_msgs.append(MsgInfo(0, joint_msg))
+        self.new_msgs[0] = joint_msg
 
         
 class JointCommand:
@@ -119,7 +118,7 @@ class IPCManager:
         self.state_fmt = '!QQQ' + 'd' * joint_state_size
         self.data_fmts = {}
         for k, v in data_subscriber_info.items():
-            self.data_fmts[k] = '!QQQ' + 'd' * v.size
+            self.data_fmts[k] = '!QQ' + 'd' * v.size
 
     def __enter__(self):
         #print("Waiting for connection")
@@ -194,13 +193,20 @@ class IPCManager:
 
     def send_data_to_julia(self, timestamp, data_type, data):
         # Determine packet format. 0 is for joint states, otherwise format is from data_fmts (1-indexed)
-        fmt = self.state_fmt if data_type == 0 else self.data_fmts[data_type]
-        message = struct.pack(fmt, 
-            timestamp, 
-            self.sequence_number, 
-            data_type,
-            *data
-        )
+        if data_type == 0:
+            message = struct.pack(self.state_fmt, 
+                timestamp,
+                data_type,
+                self.sequence_number,
+                *data
+            )
+            self.sequence_number += 1
+        else:
+            message = struct.pack(self.data_fmts[data_type], 
+                timestamp,
+                data_type,
+                *data
+            )
         # print(sequence_number)
         (remote_addr, remote_port) = self.command_socket.getpeername()
         result = self.send_data_socket.sendto(message, (remote_addr, remote_port))
@@ -208,8 +214,6 @@ class IPCManager:
         if result != len(message):
             print(f"Failed to send: Sent {result} bytes, expected {len(message)} bytes.")
             exit(1)
-        self.sequence_number += 1
-
 
 
 ####################################################################################################
@@ -224,9 +228,8 @@ def loop_waiting(socket_manager):
         elif command == "":
             # Send state to julia every 100ms
             if len(ros_manager.new_msgs) > 0: # New msg received from ROS subscriber
-                msg_type = ros_manager.new_msgs[0].type
-                forward_data_to_julia(socket_manager, ros_manager)
-                if msg_type == 0:
+                forward_data_to_julia(socket_manager, ros_manager, warmup=True)
+                if 0 in ros_manager.new_msgs:
                     print("Sent initial state")
             else:
                 print("No state message received from ROS yet... retrying")
@@ -235,19 +238,21 @@ def loop_waiting(socket_manager):
             print(f"Unexpected command in state WAITING: \"{command}\".")
             return STATE_STOPPED
 
-def forward_data_to_julia(socket_manager: IPCManager, ros_manager: ROSManager):
-    while len(ros_manager.new_msgs) > 0:
-        msg_info = ros_manager.new_msgs[0]
-        ros_manager.new_msgs.popleft()  # Clear the message
+def forward_data_to_julia(socket_manager: IPCManager, ros_manager: ROSManager, warmup=False):
+    for msg_type, msg in ros_manager.new_msgs.items():
+        # During warmup, only control messages are processed
+        if warmup and msg_type != 0:
+            continue
 
         msg_vec = []
-        if msg_info.type == 0:
+        if msg_type == 0:
             # Joint states
-            msg_vec.extend(msg_info.msg.position)
-            msg_vec.extend(msg_info.msg.velocity)
+            msg_vec.extend(msg.position)
+            msg_vec.extend(msg.velocity)
         else:
-            msg_vec = msg_info.data
-        socket_manager.send_data_to_julia(time.time_ns(), msg_info.type, msg_vec) # Send to julia
+            msg_vec = msg.data
+        socket_manager.send_data_to_julia(time.time_ns(), msg_type, msg_vec) # Send to julia
+    ros_manager.new_msgs = {}  # Clear new messages
 
 def send_recv_send_recv_wait(socket_manager, ros_manager: ROSManager, set_zero=False):
     # print(ros_manager.new_msg.position)

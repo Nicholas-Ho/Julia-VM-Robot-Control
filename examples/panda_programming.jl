@@ -14,6 +14,8 @@ using StaticArrays
 using .Threads 
 using VMRobotControl
 
+using JSON
+
 using VMRobotControl:
     DEFAULT_GRAVITY,
     DEFAULT_F_SETUP,
@@ -35,16 +37,16 @@ mutable struct RobotStatePacket
     state::Vector{Float64}
 end
 
-mutable struct TargetPosPacket
-    target_pos::Vector{Float64}
+mutable struct DataPacket
+    data::Vector{Float64}
 end
 
 mutable struct ROSPyConnectionStatus
     sequence_number::UInt64
     received_packets::UInt64
     processed_packets::UInt64
-    last_received::RobotStatePacket
-    target_pos_received::TargetPosPacket
+    last_state_received::RobotStatePacket
+    new_data_received::Dict{UInt64, DataPacket}
 end
 
 function print_connection_status_summary(connection)
@@ -57,11 +59,20 @@ function print_connection_status_summary(connection)
     end
 end
 
+function parse_json_config(filename::AbstractString)
+    config = JSON.parsefile(filename)
+    data_sizes = Dict{Uint64, Uint64}()
+    for subscriber in config["ros"]["data"]["subscriber"]
+        connection[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
+    end
+    return data_sizes
+end
+
 struct ROSPyClientConnection
     # config
     num_torques::Int
     num_states::Int
-    num_targets::Int  # Serialised data
+    data_sizes::Dict{Uint64, Uint64}
     # Sockets
     command_socket::TCPSocket
     data_socket::UDPSocket
@@ -80,7 +91,7 @@ struct ROSPyClientConnection
             command_socket::TCPSocket,
             num_torques::Int,
             num_states::Int,
-            num_targets::Int
+            data_sizes::Dict{Uint64, Uint64}
         )
         # Bind the data socket to the same address as the command socket
         @assert isopen(command_socket)
@@ -88,7 +99,7 @@ struct ROSPyClientConnection
         data_socket = UDPSocket()
         bind(data_socket, bound_ip, bound_port)
         # Each "target" is a 3D position (x,y,z)
-        status = ROSPyConnectionStatus(0, 0, 0, RobotStatePacket(0, 0, zeros(num_states)), TargetPosPacket(zeros(5*num_targets)))
+        status = ROSPyConnectionStatus(0, 0, 0, RobotStatePacket(0, 0, zeros(num_states)), Dict{UInt64, DataPacket}())
         # Start a task to receive commands on the tcp socket
         stop = Threads.Atomic{Bool}(false)
         recv_tcp_lock = ReentrantLock()
@@ -110,7 +121,7 @@ struct ROSPyClientConnection
         recv_udp_task = @async begin
             while !stop[]
                 data = recv(data_socket)
-                parse_rospy_packet!(status_lock, status, data)
+                parse_rospy_packet!(status_lock, status, data, data_sizes)
                 yield()
             end
         end
@@ -120,7 +131,7 @@ struct ROSPyClientConnection
         new(
             num_torques,
             num_states,
-            num_targets, # Not sure what exactly is this
+            data_sizes,
             command_socket,
             data_socket,
             status,
@@ -140,30 +151,45 @@ function my_time_ns()
     UInt64(time() * 1e9)
 end
 
-function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::Vector{UInt8})
+function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::Vector{UInt8}, data_sizes::Dict{Uint64, Uint64})
     Base.@lock status_lock begin
-        expected_length = sizeof(UInt64) + sizeof(UInt64) +
-         length(status.last_received.state) * sizeof(Float64) + length(status.target_pos_received.target_pos) * sizeof(Float64)
+        # Start reading
+        b = IOBuffer(data; read=true, write=false)
+        timestamp = ntoh(read(b, UInt64))
+        # Check type of data
+        data_type = ntoh(read(b, Uint64))
+        # Check for valid length
+        expected_length = sizeof(UInt64) + sizeof(UInt64) + sizeof(Uint64)
+        if data_type == 0
+            expected_length += length(status.last_state_received.state) * sizeof(Float64)
+        else
+            if !haskey(data_sizes, data_type)
+                error("Invalid message type. Check for message validity")
+            end
+            expected_length += data_sizes[data_type] * sizeof(Float64)
         if length(data) != expected_length
             error("Invalid rospy data packet length: expected $expected_length, got $(length(data))")
         end
-        b = IOBuffer(data; read=true, write=false)
-        status.last_received.timestamp = ntoh(read(b, UInt64))
-        status.last_received.sequence_number = ntoh(read(b, UInt64))
-        for i in eachindex(status.last_received.state)
-            status.last_received.state[i] = ntoh(read(b, Float64))
-        end
-        for j in eachindex(status.target_pos_received.target_pos)
-            status.target_pos_received.target_pos[j] = ntoh(read(b, Float64))
+        if data_type == 0
+            status.last_state_received.timestamp = timestamp
+            status.last_state_received.sequence_number = ntoh(read(b, UInt64))
+            for i in eachindex(status.last_state_received.state)
+                status.last_state_received.state[i] = ntoh(read(b, Float64))
+            end
+        else
+            status.new_data_received[data_type] = DataPacket(zeros(data_sizes[data_type]))
+            for i in 1:data_sizes[data_type]
+                status.new_data_received[data_type].data[i] = ntoh(read(b, Float64))
+            end
         end
         status.received_packets += 1
     end
     nothing
 end
 
-function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, num_targets::Int)
+function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sizes::Dict{Uint64, Uint64})
     command_socket = connect(rospy_ip, rospy_port)
-    ROSPyClientConnection(command_socket, num_torques, num_states, num_targets)
+    ROSPyClientConnection(command_socket, num_torques, num_states, data_sizes)
 end
 
 function _cleanup!(connection::ROSPyClientConnection)
@@ -184,8 +210,8 @@ function _cleanup!(connection::ROSPyClientConnection)
     connection
 end
 
-function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, num_targets::Int)
-    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, num_targets)
+function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sizes::Dict{Uint64, Uint64})
+    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, data_sizes)
     try
         f(connection)
     finally
@@ -213,11 +239,13 @@ function check_tcp(connection::ROSPyClientConnection)::Union{Nothing, String}
     end
 end
 
-function _get_new_packet_to_process!(connection::ROSPyClientConnection, packet::RobotStatePacket)
+function _get_new_packets_to_process!(connection::ROSPyClientConnection, packet::RobotStatePacket)
     @assert packet.sequence_number > connection.status.sequence_number
     connection.status.sequence_number = packet.sequence_number
     connection.status.processed_packets += 1
-    (deepcopy(connection.status.target_pos_received), deepcopy(connection.status.last_received))
+    result = (deepcopy(connection.status.new_data_received), deepcopy(connection.status.last_state_received))
+    empty!(connection.status.new_data_received)  # clear data
+    return result
 end
 
 function check_udp(connection::ROSPyClientConnection)
@@ -230,9 +258,9 @@ function check_udp(connection::ROSPyClientConnection)
     
     # Then check if we received a packet on the data socket
     Base.@lock connection.status_lock begin
-    #print(connection.status.last_received.timestamp)
-        if connection.status.last_received.sequence_number > connection.status.sequence_number
-            return _get_new_packet_to_process!(connection, connection.status.last_received)
+    #print(connection.status.last_state_received.timestamp)
+        if connection.status.last_state_received.sequence_number > connection.status.sequence_number || !isempty(connection.status.new_data_received)
+            return _get_new_packets_to_process!(connection, connection.status.last_state_received)
         else
             # @debug "No new UDP message to process"
             return (nothing, nothing)
@@ -269,13 +297,13 @@ function loop_warmup(connection::ROSPyClientConnection, control_func!::Function)
         yield() # To allow for interrupts
         command = check_tcp(connection)::Union{String, Nothing}
         if isnothing(command)
-            data_targets, data = check_udp(connection)
-            if !isnothing(data)
+            data, state = check_udp(connection)
+            if !isnothing(data) || !isnothing(state)
                 i, t, dt = 0, 0.0, 0.0
-                stop = control_func!(connection.torques, data.state, i, data_targets.target_pos, t, dt)
+                stop = control_func!(connection.torques, state.state, i, data, t, dt)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
-                send_torques(connection, data.sequence_number)
+                send_torques(connection, state.sequence_number)
                 print_connection_status_summary(connection)
             end
         else
@@ -296,14 +324,14 @@ function loop_active(connection::ROSPyClientConnection, control_func!::Function)
         yield() # To allow for interrupts
         command = check_tcp(connection)::Union{String, Nothing}
         if isnothing(command)
-            data_targets, data = check_udp(connection)
-            if !isnothing(data)
+            data, state = check_udp(connection)
+            if !isnothing(data) || !isnothing(state)
                 iswarmup = true
                 i, dt, t = let t0 = t; t = time(); (i+1, t - t0, t) end
-                stop = control_func!(connection.torques, data.state, i, data_targets.target_pos, t, dt)
+                stop = control_func!(connection.torques, state.state, i, data, t, dt)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
-                send_torques(connection, data.sequence_number)
+                send_torques(connection, state.sequence_number)
 
                 print_connection_status_summary(connection)
             end
@@ -338,8 +366,8 @@ end
 function get_initial_state(connection; retries=100, sleep_time=0.2, max_initial_state_age)
     for i = 1:retries
         Base.@lock connection.status_lock begin
-            if connection.status.last_received.sequence_number > 0
-                initial_state = deepcopy(connection.status.last_received)
+            if connection.status.last_state_received.sequence_number > 0
+                initial_state = deepcopy(connection.status.last_state_received)
                 targets_state = deepcopy(connection.status.target_pos_received)
                 t_ns = my_time_ns()           
                 if (t_ns - initial_state.timestamp)/1e9 > max_initial_state_age 
@@ -380,14 +408,13 @@ function ros_vm_controller(
 
     # Create control callback
     control_func! = let control_cache=control_cache, args=args
-        function control_func!(torques, state, i, target_positions, t, dt)
+        function control_func!(torques, state, i, data, t, dt)
             NDOF = robot_ndof(control_cache)
             @assert length(state) == 2*NDOF
             qʳ = view(state, 1:NDOF)
             q̇ʳ = view(state, NDOF+1:2*NDOF)
-            target_positions_ = view(target_positions, 1:5) # 1 target with 3 dimensions each (x,y,z) and 2 mechanism constants
             # Main control step
-            f_control(control_cache, target_positions_, t, args, (dt, i)) # Call user control function
+            f_control(control_cache, data, t, args, (dt, i)) # Call user control function
             torques .= control_step!(control_cache, t, qʳ, q̇ʳ) # Get torques
             return false
         end
@@ -442,22 +469,29 @@ function f_setup(cache)
     return (EndEffector_coord_id, EE_spring_id, EE_damper_id)
 end
 
-function f_control(cache, target_positions, t, setup_ret, extra)
-    EndEffector_coord_id, EE_spring_id, EE_damper_id = setup_ret
-    cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
-    if cache[EE_spring_id].stiffness != target_positions[4]
-        cache[EE_spring_id] = remake(cache[EE_spring_id]; stiffness=target_positions[4])
-    end
-    if cache[EE_damper_id].damping != target_positions[5]
-        cache[EE_damper_id] = remake(cache[EE_damper_id]; damping=target_positions[5])
+function f_control(cache, data, t, setup_ret, extra)
+    if haskey(data, 1)  # target_data
+        EndEffector_coord_id, EE_spring_id, EE_damper_id = setup_ret
+        target_positions = data[1]
+        cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
+        if cache[EE_spring_id].stiffness != target_positions[4]
+            cache[EE_spring_id] = remake(cache[EE_spring_id]; stiffness=target_positions[4])
+        end
+        if cache[EE_damper_id].damping != target_positions[5]
+            cache[EE_damper_id] = remake(cache[EE_damper_id]; damping=target_positions[5])
+        end
     end
     nothing 
 end
 
 cvms = compile(vms)
 
+# Get data config from JSON file
+const JSON_CONFIG = "./ros/rosjl_config.json"
+data_sizes = parse_json_config(JSON_CONFIG)
+
 qᵛ = Float64[]
-with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, 1) do connection
+with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, data_sizes) do connection
     ros_vm_controller(connection, cvms, qᵛ; f_control, f_setup, E_max=30.0)
 end
 
