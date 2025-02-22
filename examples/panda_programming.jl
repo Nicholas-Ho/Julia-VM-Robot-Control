@@ -37,7 +37,7 @@ mutable struct RobotStatePacket
     state::Vector{Float64}
 end
 
-mutable struct DataPacket
+mutable struct DataRecvPacket
     data::Vector{Float64}
 end
 
@@ -46,7 +46,7 @@ mutable struct ROSPyConnectionStatus
     received_packets::UInt64
     processed_packets::UInt64
     last_state_received::RobotStatePacket
-    new_data_received::Dict{UInt64, DataPacket}
+    new_data_received::Dict{UInt64, DataRecvPacket}
 end
 
 function print_connection_status_summary(connection)
@@ -61,18 +61,23 @@ end
 
 function parse_json_config(filename::AbstractString)
     config = JSON.parsefile(filename)
-    data_sizes = Dict{Uint64, Uint64}()
+    data_sub_sizes = Dict{Uint64, Uint64}()
     for subscriber in config["ros"]["data"]["subscriber"]
-        connection[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
+        data_sub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
     end
-    return data_sizes
+    data_pub_sizes = Dict{Uint64, Uint64}()
+    for subscriber in config["ros"]["data"]["publisher"]
+        data_pub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
+    end
+    return (data_pub_sizes, data_sub_sizes)
 end
 
 struct ROSPyClientConnection
     # config
     num_torques::Int
     num_states::Int
-    data_sizes::Dict{Uint64, Uint64}
+    data_sub_sizes::Dict{Uint64, Uint64}
+    data_pub_sizes::Dict{Uint64, Uint64}
     # Sockets
     command_socket::TCPSocket
     data_socket::UDPSocket
@@ -86,12 +91,14 @@ struct ROSPyClientConnection
     recv_udp_task::Task
     status_lock::ReentrantLock
     torques::Vector{Float64}
+    send_data::Dict{Uint64, Vector{Float64}}
     send_buffer::Vector{UInt8}
     function ROSPyClientConnection(
             command_socket::TCPSocket,
             num_torques::Int,
             num_states::Int,
-            data_sizes::Dict{Uint64, Uint64}
+            data_sub_sizes::Dict{Uint64, Uint64},
+            data_pub_sizes::Dict{Uint64, Uint64}
         )
         # Bind the data socket to the same address as the command socket
         @assert isopen(command_socket)
@@ -99,7 +106,7 @@ struct ROSPyClientConnection
         data_socket = UDPSocket()
         bind(data_socket, bound_ip, bound_port)
         # Each "target" is a 3D position (x,y,z)
-        status = ROSPyConnectionStatus(0, 0, 0, RobotStatePacket(0, 0, zeros(num_states)), Dict{UInt64, DataPacket}())
+        status = ROSPyConnectionStatus(0, 0, 0, RobotStatePacket(0, 0, zeros(num_states)), Dict{UInt64, DataRecvPacket}())
         # Start a task to receive commands on the tcp socket
         stop = Threads.Atomic{Bool}(false)
         recv_tcp_lock = ReentrantLock()
@@ -121,7 +128,7 @@ struct ROSPyClientConnection
         recv_udp_task = @async begin
             while !stop[]
                 data = recv(data_socket)
-                parse_rospy_packet!(status_lock, status, data, data_sizes)
+                parse_rospy_packet!(status_lock, status, data, data_sub_sizes)
                 yield()
             end
         end
@@ -131,7 +138,8 @@ struct ROSPyClientConnection
         new(
             num_torques,
             num_states,
-            data_sizes,
+            data_sub_sizes,
+            data_pub_sizes,
             command_socket,
             data_socket,
             status,
@@ -151,22 +159,26 @@ function my_time_ns()
     UInt64(time() * 1e9)
 end
 
-function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::Vector{UInt8}, data_sizes::Dict{Uint64, Uint64})
+function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::Vector{UInt8}, data_sub_sizes::Dict{Uint64, Uint64})
     Base.@lock status_lock begin
+        # Initial check
+        expected_length = sizeof(UInt64) + sizeof(UInt64) + sizeof(Uint64)
+        if length(data) < expected_length
+            error("Invalid rospy data packet length: packet smaller than expected metadata")
+        end
         # Start reading
         b = IOBuffer(data; read=true, write=false)
         timestamp = ntoh(read(b, UInt64))
         # Check type of data
         data_type = ntoh(read(b, Uint64))
         # Check for valid length
-        expected_length = sizeof(UInt64) + sizeof(UInt64) + sizeof(Uint64)
         if data_type == 0
             expected_length += length(status.last_state_received.state) * sizeof(Float64)
         else
-            if !haskey(data_sizes, data_type)
+            if !haskey(data_sub_sizes, data_type)
                 error("Invalid message type. Check for message validity")
             end
-            expected_length += data_sizes[data_type] * sizeof(Float64)
+            expected_length += data_sub_sizes[data_type] * sizeof(Float64)
         if length(data) != expected_length
             error("Invalid rospy data packet length: expected $expected_length, got $(length(data))")
         end
@@ -177,8 +189,8 @@ function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::V
                 status.last_state_received.state[i] = ntoh(read(b, Float64))
             end
         else
-            status.new_data_received[data_type] = DataPacket(zeros(data_sizes[data_type]))
-            for i in 1:data_sizes[data_type]
+            status.new_data_received[data_type] = DataRecvPacket(zeros(data_sub_sizes[data_type]))
+            for i in 1:data_sub_sizes[data_type]
                 status.new_data_received[data_type].data[i] = ntoh(read(b, Float64))
             end
         end
@@ -187,9 +199,9 @@ function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::V
     nothing
 end
 
-function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sizes::Dict{Uint64, Uint64})
+function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sub_sizes::Dict{Uint64, Uint64})
     command_socket = connect(rospy_ip, rospy_port)
-    ROSPyClientConnection(command_socket, num_torques, num_states, data_sizes)
+    ROSPyClientConnection(command_socket, num_torques, num_states, data_sub_sizes)
 end
 
 function _cleanup!(connection::ROSPyClientConnection)
@@ -210,8 +222,8 @@ function _cleanup!(connection::ROSPyClientConnection)
     connection
 end
 
-function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sizes::Dict{Uint64, Uint64})
-    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, data_sizes)
+function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sub_sizes::Dict{Uint64, Uint64})
+    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, data_sub_sizes)
     try
         f(connection)
     finally
@@ -270,19 +282,41 @@ end
 
 function send_torques(connection::ROSPyClientConnection, sequence_number::UInt64)
     # Send the send buffer on the data socket
-    @assert length(connection.send_buffer) == sizeof(Int) + sizeof(Float64) + connection.num_torques * sizeof(Float64)
+    @assert length(connection.send_buffer) == sizeof(Uint64) + sizeof(Float64) + sizeof(Int) + connection.num_torques * sizeof(Float64)
     b = IOBuffer(connection.send_buffer; read=false, write=true)
     
-    write(b, hton(sequence_number))
+    write(b, hton(0))
     write(b, hton(my_time_ns()))
+    write(b, hton(sequence_number))
     for torque in connection.torques
         write(b, hton(torque))
     end
     remote_ip, remote_port = getpeername(connection.command_socket)
     data = take!(b)
-    @assert length(data) == sizeof(UInt) + sizeof(UInt) + connection.num_torques * sizeof(Float64)
+    @assert length(data) == sizeof(Uint64) + sizeof(Float64) + sizeof(Int) + connection.num_torques * sizeof(Float64)
+    b = IOBuffer(connection.send_buffer; read=false, write=true)
     # @debug "Sending $(length(data)) bytes to $remote_ip:$remote_port"
     send(connection.data_socket, remote_ip, remote_port, data)
+end
+
+function publish_data(connection::ROSPyClientConnection)
+    # Send the send buffer on the data socket
+    for (k, v) in connection.send_data
+        new_buffer = Vector{UInt8}(undef, sizeof(Uint64) + sizeof(Float64) + connection.data_pub_sizes[k] * sizeof(Float64))
+        b = IOBuffer(new_buffer; read=false, write=true)
+        
+        write(b, hton(k))
+        write(b, hton(my_time_ns()))
+        for element in v
+            write(b, hton(element))
+        end
+        remote_ip, remote_port = getpeername(connection.command_socket)
+        data = take!(b)
+        @assert length(data) == sizeof(Uint64) + sizeof(Float64) + connection.data_pub_sizes[k] * sizeof(Float64)
+        # @debug "Sending $(length(data)) bytes to $remote_ip:$remote_port"
+        send(connection.data_socket, remote_ip, remote_port, data)
+    end
+    empty!(connection.send_data)  # Clear dictionary
 end
 
 
@@ -297,13 +331,14 @@ function loop_warmup(connection::ROSPyClientConnection, control_func!::Function)
         yield() # To allow for interrupts
         command = check_tcp(connection)::Union{String, Nothing}
         if isnothing(command)
-            data, state = check_udp(connection)
-            if !isnothing(data) || !isnothing(state)
+            sub_data, state = check_udp(connection)
+            if !isnothing(sub_data) || !isnothing(state)
                 i, t, dt = 0, 0.0, 0.0
-                stop = control_func!(connection.torques, state.state, i, data, t, dt)
+                stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.pub_data)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
                 send_torques(connection, state.sequence_number)
+                publish_data(connection)
                 print_connection_status_summary(connection)
             end
         else
@@ -324,15 +359,15 @@ function loop_active(connection::ROSPyClientConnection, control_func!::Function)
         yield() # To allow for interrupts
         command = check_tcp(connection)::Union{String, Nothing}
         if isnothing(command)
-            data, state = check_udp(connection)
-            if !isnothing(data) || !isnothing(state)
+            sub_data, state = check_udp(connection)
+            if !isnothing(sub_data) || !isnothing(state)
                 iswarmup = true
                 i, dt, t = let t0 = t; t = time(); (i+1, t - t0, t) end
-                stop = control_func!(connection.torques, state.state, i, data, t, dt)
+                stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.pub_data)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
                 send_torques(connection, state.sequence_number)
-
+                publish_data(connection)
                 print_connection_status_summary(connection)
             end
         else
@@ -408,13 +443,13 @@ function ros_vm_controller(
 
     # Create control callback
     control_func! = let control_cache=control_cache, args=args
-        function control_func!(torques, state, i, data, t, dt)
+        function control_func!(torques, state, i, t, dt, sub_data, pub_data)
             NDOF = robot_ndof(control_cache)
             @assert length(state) == 2*NDOF
             qʳ = view(state, 1:NDOF)
             q̇ʳ = view(state, NDOF+1:2*NDOF)
             # Main control step
-            f_control(control_cache, data, t, args, (dt, i)) # Call user control function
+            f_control(control_cache, sub_data, pub_data, t, args, (dt, i)) # Call user control function
             torques .= control_step!(control_cache, t, qʳ, q̇ʳ) # Get torques
             return false
         end
@@ -446,6 +481,7 @@ for (i, τ_coulomb) in zip(1:7, [5.0, 5.0, 5.0, 5.0, 3.0, 3.0, 3.0])
     isnothing(limits) && continue
     @assert ~isnothing(limits.lower) && ~isnothing(limits.upper)
     add_coordinate!(robot, JointSubspace("panda_joint$i");    id="J$i")
+    add_coordinate!(robot, FramePoint("panda_joint$i"), SVector(0., 0., 0); id="PositionJ$i")
     add_deadzone_springs!(robot, 50.0, (limits.lower+0.1, limits.upper-0.1), "J$i")
     add_component!(robot, TanhDamper(τ_coulomb, β, "J$i");         id="JointDamper$i")
 end;
@@ -469,10 +505,11 @@ function f_setup(cache)
     return (EndEffector_coord_id, EE_spring_id, EE_damper_id)
 end
 
-function f_control(cache, data, t, setup_ret, extra)
-    if haskey(data, 1)  # target_data
+function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
+    # Update with received data
+    if haskey(sub_data, 1)  # target_data
         EndEffector_coord_id, EE_spring_id, EE_damper_id = setup_ret
-        target_positions = data[1]
+        target_positions = sub_data[1]
         cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
         if cache[EE_spring_id].stiffness != target_positions[4]
             cache[EE_spring_id] = remake(cache[EE_spring_id]; stiffness=target_positions[4])
@@ -488,10 +525,10 @@ cvms = compile(vms)
 
 # Get data config from JSON file
 const JSON_CONFIG = "./ros/rosjl_config.json"
-data_sizes = parse_json_config(JSON_CONFIG)
+data_sub_sizes, data_pub_sizes = parse_json_config(JSON_CONFIG)
 
 qᵛ = Float64[]
-with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, data_sizes) do connection
+with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, data_sub_sizes, data_pub_sizes) do connection
     ros_vm_controller(connection, cvms, qᵛ; f_control, f_setup, E_max=30.0)
 end
 

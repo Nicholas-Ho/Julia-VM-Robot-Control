@@ -20,17 +20,18 @@ from collections import namedtuple
 from typing import Dict
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-DataSubscriberInfo = namedtuple('DataSubscriberInfo', ['topic', 'size'])
+DataMessageInfo = namedtuple('DataMessageInfo', ['topic', 'size'])
 
 class ROSManager:
     control_subscriber_topic = None
     control_publisher_topic = None
-    data_subscriber_topics = []
     joint_command_size = None
     joint_state_size = None
-    data_sizes = []
     publisher = None
+    data_publishers = {}
     joint_command_message = None
+    data_subscriber_info = {}
+    data_publisher_info = {}
     rate = None
     new_msgs = {}
 
@@ -39,7 +40,8 @@ class ROSManager:
                  control_publisher_topic,
                  joint_command_size,
                  joint_state_size,
-                 data_subscriber_info: Dict[int, DataSubscriberInfo],
+                 data_subscriber_info: Dict[int, DataMessageInfo],
+                 data_publisher_info: Dict[int, DataMessageInfo],
                  rate):
         rospy.init_node('vmc_control')
         self.rate = rospy.Rate(rate)
@@ -68,6 +70,9 @@ class ROSManager:
                 assert len(msg.data) == size
                 self.new_msgs[k] = msg
             rospy.Subscriber(v.topic, Float64MultiArray, f)
+        self.data_publisher_info = data_publisher_info
+        for k, v in self.data_publisher_info.items():
+            self.data_publishers[k] = rospy.Publisher(v.topic, Float64MultiArray, queue_size=1)
 
     def _control_subscriber_callback(self, joint_msg):
         assert self.joint_state_size%2 == 0 
@@ -96,7 +101,9 @@ class IPCManager:
     listen_port = None
     joint_command_size = None
     joint_state_size = None
-    data_sizes = []
+    data_sub_fmts = {}
+    data_pub_fmts = {}
+    max_pub_fmt_size = None
     # Constants
     torque_fmt = None
     state_fmt = None
@@ -108,17 +115,33 @@ class IPCManager:
     state = None
     sequence_number = None
 
-    def __init__(self, listen_ip, listen_port, joint_command_size, joint_state_size, data_subscriber_info: Dict[int, DataSubscriberInfo]):
+    def __init__(self,
+                 listen_ip,
+                 listen_port,
+                 joint_command_size,
+                 joint_state_size,
+                 data_subscriber_info: Dict[int, DataMessageInfo],
+                 data_publisher_info: Dict[int, DataMessageInfo]):
         self.listen_ip = listen_ip
         self.listen_port = listen_port
         self.joint_command_size = joint_command_size
         self.joint_state_size = joint_state_size
         # ! indicates network endianness, Q for unsigned 64 bit integer, d for 64 bit float
-        self.torque_fmt = '!QQ' + 'd' * joint_command_size
+        # Control messages: (timestamp, message_type, sequence_num, *contents)
+        self.torque_fmt = '!QQQ' + 'd' * joint_command_size
         self.state_fmt = '!QQQ' + 'd' * joint_state_size
-        self.data_fmts = {}
+        
+        self.max_pub_fmt_size = struct.calcsize(self.torque_fmt)
+
+        # Data messages: (timestamp, message_type, *contents)
+        self.data_sub_fmts = {}
         for k, v in data_subscriber_info.items():
-            self.data_fmts[k] = '!QQ' + 'd' * v.size
+            self.data_sub_fmts[k] = '!QQ' + 'd' * v.size
+        self.data_pub_fmts = {}
+        for k, v in data_publisher_info.items():
+            self.data_pub_fmts[k] = '!QQ' + 'd' * v.size
+            self.max_pub_fmt_size = max(self.max_pub_fmt_size,
+                                        struct.calcsize(self.data_pub_fmts[k]))
 
     def __enter__(self):
         #print("Waiting for connection")
@@ -174,25 +197,39 @@ class IPCManager:
         self.send_data_socket = None
         self.state = None
 
-    def recv_joint_command(self):
-        n_bytes = struct.calcsize(self.torque_fmt)
+    def recv_data_from_julia(self):
+        pub_data = {}
+        command = None
         try:
-            data = self.data_socket.recv(n_bytes)
-            data_unpacked = struct.unpack(self.torque_fmt, data)
-            sequence_number = data_unpacked[0]
-            timestamp = data_unpacked[1]
-            torques = data_unpacked[2:2+self.joint_command_size]
-            assert len(torques) == self.joint_command_size
-            command = JointCommand(sequence_number, timestamp, torques)
+            # UDP - only 1 message per recv. Allow capacity for largest message.
+            data = self.data_socket.recv(self.max_pub_fmt_size)
+
+            # Loop while there is data
+            while len(data) > 0:
+                # Determine message type
+                UNIVERSAL_METADATA_SIZE = 2 * 8  # in bytes, for (timestamp, message_type) : Tuple[uint64, uint64]
+                metadata_unpacked = struct.unpack('!QQ', data[:UNIVERSAL_METADATA_SIZE])
+                timestamp = metadata_unpacked[0]
+                data_type = metadata_unpacked[1]
+
+                if data_type == 0:
+                    data_unpacked = struct.unpack(self.torque_fmt, data)
+                    sequence_number = data_unpacked[2]
+                    torques = data_unpacked[3:3+self.joint_command_size]
+                    assert len(torques) == self.joint_command_size
+                    command = JointCommand(sequence_number, timestamp, torques)
+                else:
+                    data_unpacked = struct.unpack(self.data_pub_fmts[data_type], data)
+                    pub_data[data_type] = data_unpacked[2:]
         except socket.error as e:
             if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 print(f"Failed to recv: {e}")
                 raise e
             return None
-        return command
+        return (pub_data, command)
 
     def send_data_to_julia(self, timestamp, data_type, data):
-        # Determine packet format. 0 is for joint states, otherwise format is from data_fmts (1-indexed)
+        # Determine packet format. 0 is for joint states, otherwise format is from data_sub_fmts (1-indexed)
         if data_type == 0:
             message = struct.pack(self.state_fmt, 
                 timestamp,
@@ -202,7 +239,7 @@ class IPCManager:
             )
             self.sequence_number += 1
         else:
-            message = struct.pack(self.data_fmts[data_type], 
+            message = struct.pack(self.data_sub_fmts[data_type], 
                 timestamp,
                 data_type,
                 *data
@@ -254,18 +291,23 @@ def forward_data_to_julia(socket_manager: IPCManager, ros_manager: ROSManager, w
         socket_manager.send_data_to_julia(time.time_ns(), msg_type, msg_vec) # Send to julia
     ros_manager.new_msgs = {}  # Clear new messages
 
-def send_recv_send_recv_wait(socket_manager, ros_manager: ROSManager, set_zero=False):
+def send_recv_send_recv_wait(socket_manager: IPCManager, ros_manager: ROSManager, set_zero=False):
     # print(ros_manager.new_msg.position)
     # print(ros_manager.new_targets_msg)
     if len(ros_manager.new_msgs) > 0: # New msgs received from ROS subscriber
         forward_data_to_julia(socket_manager, ros_manager)
-    command = socket_manager.recv_joint_command() 
+    data, command = socket_manager.recv_data_from_julia()
     if command is not None: # New torque command received from julia
         if set_zero:
             ros_manager.joint_command_message.data = 0 * command.torques
         else:
             ros_manager.joint_command_message.data = command.torques
         ros_manager.publisher.publish(ros_manager.joint_command_message) # Publish via ROS
+    if len(data) > 0:  # New data to publish
+        for k, v in data.items():
+            msg = Float64MultiArray()
+            msg.data = v
+            ros_manager.data_publishers[k].publish(msg)
     ros_manager.rate.sleep()
 
 def loop_warmup(socket_manager, ros_manager):
@@ -321,12 +363,22 @@ if __name__ == '__main__':
     joint_state_topic = cfg["ros"]["control"]["joint_states"]["topic"]
 
     # Handle multiple topics via different packets (and sizes)
+    # Subscribers
     data_subscriber_info = {}
     for entry in cfg["ros"]["data"]["subscriber"]:
         if entry["id"] == 0:
             raise Exception("The subscriber index 0 is reserved for control messages")
         data_subscriber_info[entry["id"]] = \
-            DataSubscriberInfo(entry["topic"],
+            DataMessageInfo(entry["topic"],
+                               entry["data_point_size"] * entry["data_points"])
+        
+    # Publishers
+    data_publisher_info = {}
+    for entry in cfg["ros"]["data"]["publisher"]:
+        if entry["id"] == 0:
+            raise Exception("The publisher index 0 is reserved for control messages")
+        data_publisher_info[entry["id"]] = \
+            DataMessageInfo(entry["topic"],
                                entry["data_point_size"] * entry["data_points"])
 
     # Network config
@@ -343,6 +395,7 @@ if __name__ == '__main__':
         joint_command_size,
         joint_state_size,
         data_subscriber_info,
+        data_publisher_info,
         rate
     )
 
@@ -352,7 +405,8 @@ if __name__ == '__main__':
         listen_port,
         joint_command_size,
         joint_state_size,
-        data_subscriber_info    
+        data_subscriber_info,
+        data_publisher_info
     )
 
     while not rospy.is_shutdown():

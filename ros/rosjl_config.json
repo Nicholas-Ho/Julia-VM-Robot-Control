@@ -24,6 +24,7 @@
             ],
             "publisher": [
                 {
+                    "id": 1,
                     "topic": "/joint_cartesian",
                     "data_point_size": 3,
                     "data_points": 8
