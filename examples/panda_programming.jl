@@ -499,6 +499,13 @@ add_component!(vms, TanhSpring("EE pos error"; max_force=5.0, stiffness=150.0); 
 add_component!(vms, LinearDamper(10.0, "EE pos error"); id="EE_damper")
 
 function f_setup(cache)
+    # Joint positions
+    joint_coord_ids = []
+    for i in 1:7
+        push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.PositionJ$i"))
+    end
+    push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.EndEffector"))
+
     EndEffector_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
     EE_spring_id = get_compiled_componentID(cache, "EE_spring")
     EE_damper_id = get_compiled_componentID(cache, "EE_damper")
@@ -506,9 +513,10 @@ function f_setup(cache)
 end
 
 function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
+    joint_coord_ids, EETarget_coord_id, EE_spring_id, EE_damper_id = setup_ret
+
     # Update with received data
     if haskey(sub_data, 1)  # target_data
-        EndEffector_coord_id, EE_spring_id, EE_damper_id = setup_ret
         target_positions = sub_data[1]
         cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
         if cache[EE_spring_id].stiffness != target_positions[4]
@@ -518,6 +526,16 @@ function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
             cache[EE_damper_id] = remake(cache[EE_damper_id]; damping=target_positions[5])
         end
     end
+
+    # Publish joint positions
+    joint_positions = Vector{Float64}(0, 3 * 8)
+    for i in 1:8
+        x, y, z = cache[joint_coord_ids[i]].coord_data.val[].data
+        joint_positions[index*3-2] = x
+        joint_positions[index*3-1] = y
+        joint_positions[index*3] = z
+    end
+    pub_data[1] = joint_positions
     nothing 
 end
 
