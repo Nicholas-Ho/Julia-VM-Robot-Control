@@ -15,6 +15,7 @@ using .Threads
 using VMRobotControl
 
 using JSON
+using DataStructures
 
 using VMRobotControl:
     DEFAULT_GRAVITY,
@@ -65,7 +66,7 @@ function parse_json_config(filename::AbstractString)
     for subscriber in config["ros"]["data"]["subscriber"]
         data_sub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
     end
-    data_pub_sizes = Dict{Uint64, Uint64}()
+    data_pub_sizes = SortedDict{Uint64, Uint64}()
     for subscriber in config["ros"]["data"]["publisher"]
         data_pub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
     end
@@ -77,7 +78,7 @@ struct ROSPyClientConnection
     num_torques::Int
     num_states::Int
     data_sub_sizes::Dict{Uint64, Uint64}
-    data_pub_sizes::Dict{Uint64, Uint64}
+    data_pub_sizes::SortedDict{Uint64, Uint64}
     # Sockets
     command_socket::TCPSocket
     data_socket::UDPSocket
@@ -98,7 +99,7 @@ struct ROSPyClientConnection
             num_torques::Int,
             num_states::Int,
             data_sub_sizes::Dict{Uint64, Uint64},
-            data_pub_sizes::Dict{Uint64, Uint64}
+            data_pub_sizes::SortedDict{Uint64, Uint64}
         )
         # Bind the data socket to the same address as the command socket
         @assert isopen(command_socket)
@@ -134,7 +135,12 @@ struct ROSPyClientConnection
         end
         # Allocate space for sending data from
         torques = zeros(num_torques)
-        send_buffer = Vector{UInt8}(undef, sizeof(Int) + sizeof(Float64) + num_torques * sizeof(Float64))
+        send_data = Dict{Uint64, Vector{Float64}}(o=>forward)
+        send_buffer_size = sizeof(Int) + sizeof(Float64) + num_torques * sizeof(Float64)
+        for (_, size) in data_pub_size
+            send_buffer_size += size * sizeof(Float64)
+        end
+        send_buffer = Vector{UInt8}(undef, send_buffer_size)
         new(
             num_torques,
             num_states,
@@ -150,6 +156,7 @@ struct ROSPyClientConnection
             recv_udp_task,
             status_lock,
             torques,
+            send_data,
             send_buffer
         )
     end
@@ -280,43 +287,33 @@ function check_udp(connection::ROSPyClientConnection)
     end
 end
 
-function send_torques(connection::ROSPyClientConnection, sequence_number::UInt64)
+function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64)
     # Send the send buffer on the data socket
-    @assert length(connection.send_buffer) == sizeof(Uint64) + sizeof(Float64) + sizeof(Int) + connection.num_torques * sizeof(Float64)
+    expected_buffer_size = sizeof(Uint64) + sizeof(Float64) + connection.num_torques * sizeof(Float64)
+    for (_, size) in connection.data_pub_size
+        expected_buffer_size += size * sizeof(Float64)
+    end
+    @assert length(connection.send_buffer) == expected_buffer_size
     b = IOBuffer(connection.send_buffer; read=false, write=true)
-    
-    write(b, hton(0))
+
     write(b, hton(my_time_ns()))
     write(b, hton(sequence_number))
     for torque in connection.torques
         write(b, hton(torque))
     end
-    remote_ip, remote_port = getpeername(connection.command_socket)
-    data = take!(b)
-    @assert length(data) == sizeof(Uint64) + sizeof(Float64) + sizeof(Int) + connection.num_torques * sizeof(Float64)
-    b = IOBuffer(connection.send_buffer; read=false, write=true)
-    # @debug "Sending $(length(data)) bytes to $remote_ip:$remote_port"
-    send(connection.data_socket, remote_ip, remote_port, data)
-end
 
-function publish_data(connection::ROSPyClientConnection)
-    # Send the send buffer on the data socket
+    # Other data
     for (k, v) in connection.send_data
-        new_buffer = Vector{UInt8}(undef, sizeof(Uint64) + sizeof(Float64) + connection.data_pub_sizes[k] * sizeof(Float64))
-        b = IOBuffer(new_buffer; read=false, write=true)
-        
-        write(b, hton(k))
-        write(b, hton(my_time_ns()))
         for element in v
             write(b, hton(element))
         end
-        remote_ip, remote_port = getpeername(connection.command_socket)
-        data = take!(b)
-        @assert length(data) == sizeof(Uint64) + sizeof(Float64) + connection.data_pub_sizes[k] * sizeof(Float64)
-        # @debug "Sending $(length(data)) bytes to $remote_ip:$remote_port"
-        send(connection.data_socket, remote_ip, remote_port, data)
     end
-    empty!(connection.send_data)  # Clear dictionary
+
+    remote_ip, remote_port = getpeername(connection.command_socket)
+    data = take!(b)
+    @assert length(data) == sizeof(Uint64) + sizeof(Float64) + connection.data_pub_sizes[k] * sizeof(Float64)
+    # @debug "Sending $(length(data)) bytes to $remote_ip:$remote_port"
+    send(connection.data_socket, remote_ip, remote_port, data)
 end
 
 
@@ -337,8 +334,7 @@ function loop_warmup(connection::ROSPyClientConnection, control_func!::Function)
                 stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.pub_data)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
-                send_torques(connection, state.sequence_number)
-                publish_data(connection)
+                publish_data(connection, state.sequence_number)
                 print_connection_status_summary(connection)
             end
         else
@@ -366,8 +362,7 @@ function loop_active(connection::ROSPyClientConnection, control_func!::Function)
                 stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.pub_data)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
-                send_torques(connection, state.sequence_number)
-                publish_data(connection)
+                publish_data(connection, state.sequence_number)
                 print_connection_status_summary(connection)
             end
         else

@@ -102,10 +102,9 @@ class IPCManager:
     joint_command_size = None
     joint_state_size = None
     data_sub_fmts = {}
-    data_pub_fmts = {}
-    max_pub_fmt_size = None
+    data_pub_sizes = {}
     # Constants
-    torque_fmt = None
+    publish_fmt = None
     state_fmt = None
     # State
     command_socket = None
@@ -128,20 +127,19 @@ class IPCManager:
         self.joint_state_size = joint_state_size
         # ! indicates network endianness, Q for unsigned 64 bit integer, d for 64 bit float
         # Control messages: (timestamp, message_type, sequence_num, *contents)
-        self.torque_fmt = '!QQQ' + 'd' * joint_command_size
         self.state_fmt = '!QQQ' + 'd' * joint_state_size
-        
-        self.max_pub_fmt_size = struct.calcsize(self.torque_fmt)
 
         # Data messages: (timestamp, message_type, *contents)
         self.data_sub_fmts = {}
         for k, v in data_subscriber_info.items():
             self.data_sub_fmts[k] = '!QQ' + 'd' * v.size
-        self.data_pub_fmts = {}
-        for k, v in data_publisher_info.items():
-            self.data_pub_fmts[k] = '!QQ' + 'd' * v.size
-            self.max_pub_fmt_size = max(self.max_pub_fmt_size,
-                                        struct.calcsize(self.data_pub_fmts[k]))
+
+        # Messages to publish are sent from Julia in a single serialised packet, sorted by ID
+        self.publish_fmt = '!QQ' + 'd' * joint_command_size
+        self.data_pub_sizes = [(0, joint_command_size)]
+        for k, v in sorted(data_publisher_info.items(), key=lambda x: x[0]):
+            self.publish_fmt += 'd' * v.size
+            self.data_pub_sizes.append((k, v.size))
 
     def __enter__(self):
         #print("Waiting for connection")
@@ -202,25 +200,21 @@ class IPCManager:
         command = None
         try:
             # UDP - only 1 message per recv. Allow capacity for largest message.
-            data = self.data_socket.recv(self.max_pub_fmt_size)
+            n_bytes = struct.calcsize(self.publish_fmt)
+            data = self.data_socket.recv(n_bytes)
 
-            # Loop while there is data
-            while len(data) > 0:
-                # Determine message type
-                UNIVERSAL_METADATA_SIZE = 2 * 8  # in bytes, for (timestamp, message_type) : Tuple[uint64, uint64]
-                metadata_unpacked = struct.unpack('!QQ', data[:UNIVERSAL_METADATA_SIZE])
-                timestamp = metadata_unpacked[0]
-                data_type = metadata_unpacked[1]
+            timestamp = data[0]
+            sequence_number = data[1]
+            torques = data[2:2+self.joint_command_size]
+            assert len(torques) == self.joint_command_size
+            command = JointCommand(sequence_number, timestamp, torques)
 
-                if data_type == 0:
-                    data_unpacked = struct.unpack(self.torque_fmt, data)
-                    sequence_number = data_unpacked[2]
-                    torques = data_unpacked[3:3+self.joint_command_size]
-                    assert len(torques) == self.joint_command_size
-                    command = JointCommand(sequence_number, timestamp, torques)
-                else:
-                    data_unpacked = struct.unpack(self.data_pub_fmts[data_type], data)
-                    pub_data[data_type] = data_unpacked[2:]
+            # Extract other data contents
+            pub_data = {}
+            curr_index = 2+self.joint_command_size
+            for id, size in self.data_pub_sizes:
+                pub_data[id] = data[curr_index:curr_index+size]
+                curr_index += size
         except socket.error as e:
             if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 print(f"Failed to recv: {e}")
@@ -367,19 +361,27 @@ if __name__ == '__main__':
     data_subscriber_info = {}
     for entry in cfg["ros"]["data"]["subscriber"]:
         if entry["id"] == 0:
-            raise Exception("The subscriber index 0 is reserved for control messages")
+            raise Exception("The subscriber ID 0 is reserved for control messages")
+        if entry["id"] < 0:
+            raise Exception("Subscriber ID must be non-negative")
+        if entry["id"] in data_subscriber_info:
+            raise Exception("Subscriber ID must be unique")
         data_subscriber_info[entry["id"]] = \
             DataMessageInfo(entry["topic"],
-                               entry["data_point_size"] * entry["data_points"])
+                            entry["data_point_size"] * entry["data_points"])
         
     # Publishers
     data_publisher_info = {}
     for entry in cfg["ros"]["data"]["publisher"]:
         if entry["id"] == 0:
-            raise Exception("The publisher index 0 is reserved for control messages")
+            raise Exception("The publisher ID 0 is reserved for control messages")
+        if entry["id"] < 0:
+            raise Exception("Publisher ID must be non-negative")
+        if entry["id"] in data_publisher_info:
+            raise Exception("Publisher ID must be unique")
         data_publisher_info[entry["id"]] = \
             DataMessageInfo(entry["topic"],
-                               entry["data_point_size"] * entry["data_points"])
+                            entry["data_point_size"] * entry["data_points"])
 
     # Network config
     listen_port = cfg["listen_port"] if "listen_port" in cfg else 25342
