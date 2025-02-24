@@ -64,7 +64,7 @@ class ROSManager:
         self.data_subscriber_info = data_subscriber_info
         for k, v in self.data_subscriber_info.items():
             size = v.size
-            def f(self, msg):
+            def f(msg):
                 assert len(msg.data) == size
                 self.new_msgs[k] = msg
             rospy.Subscriber(v.topic, Float64MultiArray, f)
