@@ -66,7 +66,7 @@ class ROSManager:
         self.data_subscriber_info = data_subscriber_info
         for k, v in self.data_subscriber_info.items():
             size = v.size
-            def f(self, msg):
+            def f(msg):
                 assert len(msg.data) == size
                 self.new_msgs[k] = msg
             rospy.Subscriber(v.topic, Float64MultiArray, f)
@@ -199,7 +199,6 @@ class IPCManager:
         pub_data = {}
         command = None
         try:
-            # UDP - only 1 message per recv. Allow capacity for largest message.
             n_bytes = struct.calcsize(self.publish_fmt)
             data = self.data_socket.recv(n_bytes)
 
