@@ -70,7 +70,7 @@ function parse_json_config(filename::AbstractString)
     for subscriber in config["ros"]["data"]["publisher"]
         data_pub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
     end
-    return (data_pub_sizes, data_sub_sizes)
+    return (data_sub_sizes, data_pub_sizes)
 end
 
 struct ROSPyClientConnection
@@ -92,7 +92,7 @@ struct ROSPyClientConnection
     recv_udp_task::Task
     status_lock::ReentrantLock
     torques::Vector{Float64}
-    send_data::Dict{UInt64, Vector{Float64}}
+    send_data::SortedDict{UInt64, Vector{Float64}}
     send_buffer::Vector{UInt8}
     function ROSPyClientConnection(
             command_socket::TCPSocket,
@@ -135,9 +135,9 @@ struct ROSPyClientConnection
         end
         # Allocate space for sending data from
         torques = zeros(num_torques)
-        send_data = Dict{UInt64, Vector{Float64}}(o=>forward)
+        send_data = SortedDict{UInt64, Vector{Float64}}()
         send_buffer_size = sizeof(Int) + sizeof(Float64) + num_torques * sizeof(Float64)
-        for (_, size) in data_pub_size
+        for (_, size) in data_pub_sizes
             send_buffer_size += size * sizeof(Float64)
         end
         send_buffer = Vector{UInt8}(undef, send_buffer_size)
@@ -186,6 +186,7 @@ function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::V
                 error("Invalid message type. Check for message validity")
             end
             expected_length += data_sub_sizes[data_type] * sizeof(Float64)
+        end
         if length(data) != expected_length
             error("Invalid rospy data packet length: expected $expected_length, got $(length(data))")
         end
@@ -206,9 +207,14 @@ function parse_rospy_packet!(status_lock, status::ROSPyConnectionStatus, data::V
     nothing
 end
 
-function _connect(rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sub_sizes::Dict{UInt64, UInt64})
+function _connect(rospy_ip,
+                  rospy_port,
+                  num_torques::Int,
+                  num_states::Int,
+                  data_sub_sizes::Dict{UInt64, UInt64},
+                  data_pub_sizes::SortedDict{UInt64, UInt64})
     command_socket = connect(rospy_ip, rospy_port)
-    ROSPyClientConnection(command_socket, num_torques, num_states, data_sub_sizes)
+    ROSPyClientConnection(command_socket, num_torques, num_states, data_sub_sizes, data_pub_sizes)
 end
 
 function _cleanup!(connection::ROSPyClientConnection)
@@ -230,8 +236,14 @@ function _cleanup!(connection::ROSPyClientConnection)
     connection
 end
 
-function with_rospy_connection(f::Function, rospy_ip, rospy_port, num_torques::Int, num_states::Int, data_sub_sizes::Dict{UInt64, UInt64})
-    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, data_sub_sizes)
+function with_rospy_connection(f::Function,
+                               rospy_ip,
+                               rospy_port,
+                               num_torques::Int,
+                               num_states::Int,
+                               data_sub_sizes::Dict{UInt64, UInt64},
+                               data_pub_sizes::SortedDict{UInt64, UInt64})
+    connection = _connect(rospy_ip, rospy_port, num_torques, num_states, data_sub_sizes, data_pub_sizes)
     try
         f(connection)
     finally
@@ -302,10 +314,10 @@ end
 
 function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64)
     # Send the send buffer on the data socket
-    expected_buffer_size = sizeof(UInt64) + sizeof(Float64) + connection.num_torques * sizeof(Float64)
-    for (_, size) in connection.data_pub_size
-        expected_buffer_size += size * sizeof(Float64)
-    end
+    expected_buffer_size = sizeof(UInt64) + sizeof(UInt64) + connection.num_torques * sizeof(Float64)
+    # for (_, size) in connection.data_pub_sizes
+    #     expected_buffer_size += size * sizeof(Float64)
+    # end
     @assert length(connection.send_buffer) == expected_buffer_size
     b = IOBuffer(connection.send_buffer; read=false, write=true)
 
@@ -316,7 +328,7 @@ function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64
     end
 
     # Other data
-    for (k, v) in connection.send_data
+    for (_, v) in connection.send_data
         for element in v
             write(b, hton(element))
         end
@@ -324,7 +336,7 @@ function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64
 
     remote_ip, remote_port = getpeername(connection.command_socket)
     data = take!(b)
-    @assert length(data) == sizeof(UInt64) + sizeof(Float64) + connection.data_pub_sizes[k] * sizeof(Float64)
+    @assert length(data) == expected_buffer_size
     # @debug "Sending $(length(data)) bytes to $remote_ip:$remote_port"
     send(connection.data_socket, remote_ip, remote_port, data)
 end
@@ -344,7 +356,7 @@ function loop_warmup(connection::ROSPyClientConnection, control_func!::Function)
             state, sub_data = check_udp(connection)
             if !isnothing(state)
                 i, t, dt = 0, 0.0, 0.0
-                stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.pub_data)
+                stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.send_data)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
                 publish_data(connection, state.sequence_number)
@@ -372,7 +384,7 @@ function loop_active(connection::ROSPyClientConnection, control_func!::Function)
             if !isnothing(state)
                 iswarmup = true
                 i, dt, t = let t0 = t; t = time(); (i+1, t - t0, t) end
-                stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.pub_data)
+                stop = control_func!(connection.torques, state.state, i, t, dt, sub_data, connection.send_data)
                 stop && return STATE_STOPPED # Stop the controller gracefully
                 any(isnan, connection.torques) && error("Control function returned NaN torques: $(connection.torques)")
                 publish_data(connection, state.sequence_number)
@@ -487,7 +499,7 @@ for (i, τ_coulomb) in zip(1:7, [5.0, 5.0, 5.0, 5.0, 3.0, 3.0, 3.0])
     isnothing(limits) && continue
     @assert ~isnothing(limits.lower) && ~isnothing(limits.upper)
     add_coordinate!(robot, JointSubspace("panda_joint$i");    id="J$i")
-    add_coordinate!(robot, FramePoint("panda_joint$i"), SVector(0., 0., 0); id="PositionJ$i")
+    # add_coordinate!(robot, FramePoint("panda_link$i", SVector(0., 0., 0)); id="PositionJ$i")
     add_deadzone_springs!(robot, 50.0, (limits.lower+0.1, limits.upper-0.1), "J$i")
     add_component!(robot, TanhDamper(τ_coulomb, β, "J$i");         id="JointDamper$i")
 end;
@@ -508,14 +520,14 @@ function f_setup(cache)
     # Joint positions
     joint_coord_ids = []
     for i in 1:7
-        push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.PositionJ$i"))
+        push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.J$i"))
     end
     push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.EndEffector"))
 
     EndEffector_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
     EE_spring_id = get_compiled_componentID(cache, "EE_spring")
     EE_damper_id = get_compiled_componentID(cache, "EE_damper")
-    return (EndEffector_coord_id, EE_spring_id, EE_damper_id)
+    return (joint_coord_ids, EndEffector_coord_id, EE_spring_id, EE_damper_id)
 end
 
 function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
@@ -534,12 +546,16 @@ function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
     end
 
     # Publish joint positions
-    joint_positions = Vector{Float64}(0, 3 * 8)
+    joint_positions = zeros(3 * 8)
     for i in 1:8
-        x, y, z = cache[joint_coord_ids[i]].coord_data.val[].data
-        joint_positions[index*3-2] = x
-        joint_positions[index*3-1] = y
-        joint_positions[index*3] = z
+        joint_positions[i*3-2] = i*3-2
+        joint_positions[i*3-1] = i*3-1
+        joint_positions[i*3] = i*3
+        # @info cache[joint_coord_ids[i]].coord_data
+        # x, y, z = cache[joint_coord_ids[i]].coord_data.val[].data
+        # joint_positions[i*3-2] = x
+        # joint_positions[i*3-1] = y
+        # joint_positions[i*3] = z
     end
     pub_data[1] = joint_positions
     nothing 

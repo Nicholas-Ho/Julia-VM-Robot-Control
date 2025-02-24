@@ -136,7 +136,7 @@ class IPCManager:
 
         # Messages to publish are sent from Julia in a single serialised packet, sorted by ID
         self.publish_fmt = '!QQ' + 'd' * joint_command_size
-        self.data_pub_sizes = [(0, joint_command_size)]
+        self.data_pub_sizes = []
         for k, v in sorted(data_publisher_info.items(), key=lambda x: x[0]):
             self.publish_fmt += 'd' * v.size
             self.data_pub_sizes.append((k, v.size))
@@ -148,7 +148,7 @@ class IPCManager:
         (bound_ip, bound_port) = self.command_socket.getsockname()
         self.data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP
         self.data_socket.bind((bound_ip, bound_port))
-        self.data_socket.setblocking(False)        
+        self.data_socket.setblocking(False)
         
         self.send_data_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # UDP
         self.send_data_socket.setblocking(False)
@@ -200,11 +200,13 @@ class IPCManager:
         command = None
         try:
             n_bytes = struct.calcsize(self.publish_fmt)
+            print(n_bytes)
             data = self.data_socket.recv(n_bytes)
+            data_unpacked = struct.unpack(self.torque_fmt, data)
 
-            timestamp = data[0]
-            sequence_number = data[1]
-            torques = data[2:2+self.joint_command_size]
+            timestamp = data_unpacked[0]
+            sequence_number = data_unpacked[1]
+            torques = data_unpacked[2:2+self.joint_command_size]
             assert len(torques) == self.joint_command_size
             command = JointCommand(sequence_number, timestamp, torques)
 
