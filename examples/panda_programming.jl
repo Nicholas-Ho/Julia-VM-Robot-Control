@@ -315,9 +315,9 @@ end
 function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64)
     # Send the send buffer on the data socket
     expected_buffer_size = sizeof(UInt64) + sizeof(UInt64) + connection.num_torques * sizeof(Float64)
-    # for (_, size) in connection.data_pub_sizes
-    #     expected_buffer_size += size * sizeof(Float64)
-    # end
+    for (_, size) in connection.data_pub_sizes
+        expected_buffer_size += size * sizeof(Float64)
+    end
     @assert length(connection.send_buffer) == expected_buffer_size
     b = IOBuffer(connection.send_buffer; read=false, write=true)
 

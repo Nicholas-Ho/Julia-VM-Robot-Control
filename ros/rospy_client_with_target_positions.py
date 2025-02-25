@@ -8,6 +8,7 @@ import socket
 import struct
 import sys, os
 import time
+import traceback
 
 ####################################################################################################
 # ROS stuff
@@ -198,8 +199,8 @@ class IPCManager:
     def recv_data_from_julia(self):
         pub_data = {}
         command = None
+        n_bytes = struct.calcsize(self.publish_fmt)
         try:
-            n_bytes = struct.calcsize(self.publish_fmt)
             data = self.data_socket.recv(n_bytes)
             data_unpacked = struct.unpack(self.publish_fmt, data)
 
@@ -215,6 +216,7 @@ class IPCManager:
             for id, size in self.data_pub_sizes:
                 pub_data[id] = data[curr_index:curr_index+size]
                 curr_index += size
+            pass
         except socket.error as e:
             if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 print(f"Failed to recv: {e}")
