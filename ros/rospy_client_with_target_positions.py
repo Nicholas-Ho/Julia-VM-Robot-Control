@@ -200,9 +200,8 @@ class IPCManager:
         command = None
         try:
             n_bytes = struct.calcsize(self.publish_fmt)
-            print(n_bytes)
             data = self.data_socket.recv(n_bytes)
-            data_unpacked = struct.unpack(self.torque_fmt, data)
+            data_unpacked = struct.unpack(self.publish_fmt, data)
 
             timestamp = data_unpacked[0]
             sequence_number = data_unpacked[1]
@@ -220,7 +219,7 @@ class IPCManager:
             if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 print(f"Failed to recv: {e}")
                 raise e
-            return None
+            return (None, None)
         return (pub_data, command)
 
     def send_data_to_julia(self, timestamp, data_type, data):
