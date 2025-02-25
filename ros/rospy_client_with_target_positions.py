@@ -216,7 +216,6 @@ class IPCManager:
             for id, size in self.data_pub_sizes:
                 pub_data[id] = data_unpacked[curr_index:curr_index+size]
                 curr_index += size
-            print(pub_data)
         except socket.error as e:
             if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 print(f"Failed to recv: {e}")

@@ -25,6 +25,7 @@ using VMRobotControl:
 
 using VMRobotControl: remake
 
+# Default listen port
 ROSPY_LISTEN_PORT = 25342
 
 const START = "START"
@@ -62,6 +63,24 @@ end
 
 function parse_json_config(filename::AbstractString)
     config = JSON.parsefile(filename)
+
+    # Connection config
+    if haskey(config, "listen_ip")
+        listen_ip = IPv4(config["listen_ip"])
+    else
+        listen_ip = Sockets.localhost
+    end
+    listen_port = get(config, "listen_port", ROSPY_LISTEN_PORT)
+
+    # Control networking config
+    joint_command_size = config["ros"]["control"]["joint_commands"]["size"]
+    if haskey(config["ros"]["control"]["joint_states"], "size")
+        joint_states_size = config["ros"]["control"]["joint_states"]["size"]
+    else
+        joint_states_size = joint_command_size * 2
+    end
+
+    # Data networking config
     data_sub_sizes = Dict{UInt64, UInt64}()
     for subscriber in config["ros"]["data"]["subscriber"]
         data_sub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
@@ -70,7 +89,7 @@ function parse_json_config(filename::AbstractString)
     for subscriber in config["ros"]["data"]["publisher"]
         data_pub_sizes[subscriber["id"]] = subscriber["data_point_size"] * subscriber["data_points"]
     end
-    return (data_sub_sizes, data_pub_sizes)
+    return (listen_ip, listen_port, joint_command_size, joint_states_size, data_sub_sizes, data_pub_sizes)
 end
 
 struct ROSPyClientConnection
@@ -329,7 +348,6 @@ function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64
 
     # Other data
     for (_, v) in connection.send_data
-        @info v
         for element in v
             write(b, hton(element))
         end
@@ -525,10 +543,10 @@ function f_setup(cache)
     end
     push!(link_coord_ids, get_compiled_coordID(cache, ".robot.EndEffector"))
 
-    EndEffector_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
+    EETarget_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
     EE_spring_id = get_compiled_componentID(cache, "EE_spring")
     EE_damper_id = get_compiled_componentID(cache, "EE_damper")
-    return (link_coord_ids, EndEffector_coord_id, EE_spring_id, EE_damper_id)
+    return (link_coord_ids, EETarget_coord_id, EE_spring_id, EE_damper_id)
 end
 
 function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
@@ -537,7 +555,7 @@ function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
     # Update with received data
     if haskey(sub_data, 1)  # target_data
         target_positions = sub_data[1].data
-        cache[EndEffector_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
+        cache[EETarget_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
         if cache[EE_spring_id].stiffness != target_positions[4]
             cache[EE_spring_id] = remake(cache[EE_spring_id]; stiffness=target_positions[4])
         end
@@ -549,7 +567,8 @@ function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
     # Publish link positions
     link_positions = zeros(3 * 8)
     for i in 1:8
-        x, y, z = cache[link_coord_ids[i]].coord_data.point
+        # @info configuration(cache, link_coord_ids[i])
+        x, y, z = configuration(cache, link_coord_ids[i])
         link_positions[i*3-2] = x
         link_positions[i*3-1] = y
         link_positions[i*3] = z
@@ -562,10 +581,9 @@ cvms = compile(vms)
 
 # Get data config from JSON file
 const JSON_CONFIG = "./ros/rosjl_config.json"
-data_sub_sizes, data_pub_sizes = parse_json_config(JSON_CONFIG)
 
 qᵛ = Float64[]
-with_rospy_connection(Sockets.localhost, ROSPY_LISTEN_PORT, 7, 14, data_sub_sizes, data_pub_sizes) do connection
+with_rospy_connection(parse_json_config(JSON_CONFIG)...) do connection
     ros_vm_controller(connection, cvms, qᵛ; f_control, f_setup, E_max=30.0)
 end
 
