@@ -329,6 +329,7 @@ function publish_data(connection::ROSPyClientConnection, sequence_number::UInt64
 
     # Other data
     for (_, v) in connection.send_data
+        @info v
         for element in v
             write(b, hton(element))
         end
@@ -499,7 +500,7 @@ for (i, τ_coulomb) in zip(1:7, [5.0, 5.0, 5.0, 5.0, 3.0, 3.0, 3.0])
     isnothing(limits) && continue
     @assert ~isnothing(limits.lower) && ~isnothing(limits.upper)
     add_coordinate!(robot, JointSubspace("panda_joint$i");    id="J$i")
-    # add_coordinate!(robot, FramePoint("panda_link$i", SVector(0., 0., 0)); id="PositionJ$i")
+    add_coordinate!(robot, FramePoint("panda_link$i", SVector(0., 0., 0)); id="L$i")
     add_deadzone_springs!(robot, 50.0, (limits.lower+0.1, limits.upper-0.1), "J$i")
     add_component!(robot, TanhDamper(τ_coulomb, β, "J$i");         id="JointDamper$i")
 end;
@@ -518,20 +519,20 @@ add_component!(vms, LinearDamper(10.0, "EE pos error"); id="EE_damper")
 
 function f_setup(cache)
     # Joint positions
-    joint_coord_ids = []
+    link_coord_ids = []
     for i in 1:7
-        push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.J$i"))
+        push!(link_coord_ids, get_compiled_coordID(cache, ".robot.L$i"))
     end
-    push!(joint_coord_ids, get_compiled_coordID(cache, ".robot.EndEffector"))
+    push!(link_coord_ids, get_compiled_coordID(cache, ".robot.EndEffector"))
 
     EndEffector_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
     EE_spring_id = get_compiled_componentID(cache, "EE_spring")
     EE_damper_id = get_compiled_componentID(cache, "EE_damper")
-    return (joint_coord_ids, EndEffector_coord_id, EE_spring_id, EE_damper_id)
+    return (link_coord_ids, EndEffector_coord_id, EE_spring_id, EE_damper_id)
 end
 
 function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
-    joint_coord_ids, EETarget_coord_id, EE_spring_id, EE_damper_id = setup_ret
+    link_coord_ids, EETarget_coord_id, EE_spring_id, EE_damper_id = setup_ret
 
     # Update with received data
     if haskey(sub_data, 1)  # target_data
@@ -545,19 +546,15 @@ function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
         end
     end
 
-    # Publish joint positions
-    joint_positions = zeros(3 * 8)
+    # Publish link positions
+    link_positions = zeros(3 * 8)
     for i in 1:8
-        joint_positions[i*3-2] = i*3-2
-        joint_positions[i*3-1] = i*3-1
-        joint_positions[i*3] = i*3
-        # @info cache[joint_coord_ids[i]].coord_data
-        # x, y, z = cache[joint_coord_ids[i]].coord_data.val[].data
-        # joint_positions[i*3-2] = x
-        # joint_positions[i*3-1] = y
-        # joint_positions[i*3] = z
+        x, y, z = cache[link_coord_ids[i]].coord_data.point
+        link_positions[i*3-2] = x
+        link_positions[i*3-1] = y
+        link_positions[i*3] = z
     end
-    pub_data[1] = joint_positions
+    pub_data[1] = link_positions
     nothing 
 end
 

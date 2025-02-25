@@ -214,14 +214,13 @@ class IPCManager:
             pub_data = {}
             curr_index = 2+self.joint_command_size
             for id, size in self.data_pub_sizes:
-                pub_data[id] = data[curr_index:curr_index+size]
+                pub_data[id] = data_unpacked[curr_index:curr_index+size]
                 curr_index += size
-            pass
+            print(pub_data)
         except socket.error as e:
             if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
                 print(f"Failed to recv: {e}")
                 raise e
-            return (None, None)
         return (pub_data, command)
 
     def send_data_to_julia(self, timestamp, data_type, data):
