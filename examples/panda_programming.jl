@@ -528,10 +528,15 @@ add_coordinate!(robot, FramePoint("panda_hand_tcp", SVector(0., 0., 0)); id="End
 vms = VirtualMechanismSystem("RobotProgramming", robot)
 vm = vms.virtual_mechanism
 
+for i in 1:7
+    add_coordinate!(vm, ReferenceCoord(Ref(SVector(0, 0, 0))); id="TargetL$i")
+    add_coordinate!(vms, CoordDifference(".robot.L$i", ".virtual_mechanism.TargetL$i"); id="L$i pos error")
+    add_component!(vms, TanhSpring("L$i pos error"; max_force=5.0, stiffness=0.0001); id="spring_L$i")
+    add_component!(vms, LinearDamper(10.0, "L$i pos error"); id="damper_L$i")
+end
+
 add_coordinate!(vm, ReferenceCoord(Ref(SVector(0.3, -0.5, 1.0))); id="EndEffectorTarget")
-
 add_coordinate!(vms, CoordDifference(".robot.EndEffector", ".virtual_mechanism.EndEffectorTarget"); id="EE pos error")
-
 add_component!(vms, TanhSpring("EE pos error"; max_force=5.0, stiffness=150.0); id="EE_spring")
 add_component!(vms, LinearDamper(10.0, "EE pos error"); id="EE_damper")
 
@@ -543,24 +548,39 @@ function f_setup(cache)
     end
     push!(link_coord_ids, get_compiled_coordID(cache, ".robot.EndEffector"))
 
-    EETarget_coord_id = get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget")
-    EE_spring_id = get_compiled_componentID(cache, "EE_spring")
-    EE_damper_id = get_compiled_componentID(cache, "EE_damper")
-    return (link_coord_ids, EETarget_coord_id, EE_spring_id, EE_damper_id)
+    # Targets, springs and dampers
+    targets_coord_ids = []
+    spring_ids = []
+    damper_ids = []
+    for i in 1:7
+        push!(targets_coord_ids, get_compiled_coordID(cache, ".virtual_mechanism.TargetL$i"))
+        push!(spring_ids, get_compiled_componentID(cache, "spring_L$i"))
+        push!(damper_ids, get_compiled_componentID(cache, "damper_L$i"))
+    end
+    push!(targets_coord_ids, get_compiled_coordID(cache, ".virtual_mechanism.EndEffectorTarget"))
+    push!(spring_ids, get_compiled_componentID(cache, "EE_spring"))
+    push!(damper_ids, get_compiled_componentID(cache, "EE_damper"))
+    return (link_coord_ids, targets_coord_ids, spring_ids, damper_ids)
 end
 
 function f_control(cache, sub_data, pub_data, t, setup_ret, extra)
-    link_coord_ids, EETarget_coord_id, EE_spring_id, EE_damper_id = setup_ret
+    link_coord_ids, targets_coord_ids, spring_ids, damper_ids = setup_ret
 
     # Update with received data
     if haskey(sub_data, 1)  # target_data
-        target_positions = sub_data[1].data
-        cache[EETarget_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
-        if cache[EE_spring_id].stiffness != target_positions[4]
-            cache[EE_spring_id] = remake(cache[EE_spring_id]; stiffness=target_positions[4])
-        end
-        if cache[EE_damper_id].damping != target_positions[5]
-            cache[EE_damper_id] = remake(cache[EE_damper_id]; damping=target_positions[5])
+        for i in 1:8
+            # For each link
+            target_positions = view(sub_data[1].data, ((i*5)-4):(i*5))
+            target_coord_id = targets_coord_ids[i]
+            spring_id = spring_ids[i]
+            damper_id = damper_ids[i]
+            cache[target_coord_id].coord_data.val[] = SVector(target_positions[1], target_positions[2], target_positions[3])
+            if cache[spring_id].stiffness != target_positions[4]
+                cache[spring_id] = remake(cache[spring_id]; stiffness=target_positions[4])
+            end
+            if cache[damper_id].damping != target_positions[5]
+                cache[damper_id] = remake(cache[damper_id]; damping=target_positions[5])
+            end
         end
     end
 
@@ -586,61 +606,3 @@ qᵛ = Float64[]
 with_rospy_connection(parse_json_config(JSON_CONFIG)...) do connection
     ros_vm_controller(connection, cvms, qᵛ; f_control, f_setup, E_max=30.0)
 end
-
-# tspan = (0., 20π)
-# dcache = new_dynamics_cache(compile(vms))
-# q = ([0.0, 0.3, 0.0, -1.8, 0.0, π/2, 0.0], Float64[])
-# q̇ = zero_q̇(dcache.vms)
-# g = VMRobotControl.DEFAULT_GRAVITY
-# prob = get_ode_problem(dcache, g, q, q̇, tspan)
-# @info "Simulating robot handover sample."
-# sol = solve(prob, Tsit5(); maxiters=1e5, abstol=1e-3, reltol=1e-3); # Low tol to speed up simulation
-
-# # ## Plotting
-# # We create a figure with two scenes, for two different camera angles. We plot the robot, the
-# # targets, the TCPs, and the obstacles in the scene.
-# # We use observables for the time and the kinematics cache, which will be updated in the function
-# # `animate_robot_odesolution`, causing any plots that depend upon these observables to be updated.
-# fig = Figure(size = (720, 720), figure_padding=0)
-# display(fig)
-# ls = LScene(fig[1, 1]; show_axis=false)
-# cam = cam3d!(ls, camera=:perspective, center=false)
-# cam.lookat[] = [0., 0., 0.3]
-# cam.eyeposition[] = [1.5, 0., 0.3]
-# plotting_t = Observable(0.0)
-# plotting_kcache = Observable(new_kinematics_cache(compile(vms)))
-
-# target_scatter_kwargs = (;
-#     color=:green, 
-#     marker=:+, 
-#     markersize=15, 
-#     label="Targets",
-#     transparency=true ## Avoid ugly white outline artefact on markers
-# )
-# tcp_scatter_kwargs = (;
-#     color=:blue, 
-#     marker=:x, 
-#     markersize=15, 
-#     label="TCPs",
-#     transparency=true ## Avoid ugly white outline artefact on markers
-# )
-
-
-# ## Show robot
-# robotvisualize!(ls, plotting_kcache;)
-# #robotsketch!(ls, plotting_kcache, scale=0.3, linewidth=2.5, transparency=true)
-
-# ## Label target and TCP
-# target_1_pos_id = get_compiled_coordID(plotting_kcache[], ".virtual_mechanism.LeftFingerTarget")
-# target_2_pos_id = get_compiled_coordID(plotting_kcache[], ".virtual_mechanism.RightFingerTarget")
-# target_3_pos_id = get_compiled_coordID(plotting_kcache[], ".virtual_mechanism.HandBaseTarget")
-
-# l_tcp_pos_id = get_compiled_coordID(plotting_kcache[], ".robot.LeftFinger")
-# r_tcp_pos_id = get_compiled_coordID(plotting_kcache[], ".robot.RightFinger")
-# h_tcp_pos_id = get_compiled_coordID(plotting_kcache[], ".robot.HandBase")
-
-# scatter!(ls, plotting_kcache, [target_1_pos_id, target_2_pos_id, target_3_pos_id]; target_scatter_kwargs...)
-# scatter!(ls, plotting_kcache, [l_tcp_pos_id, r_tcp_pos_id, h_tcp_pos_id]; tcp_scatter_kwargs...)
-
-# savepath = joinpath(module_path, "docs/src/assets/random_trial.mp4")
-# animate_robot_odesolution(fig, sol, plotting_kcache, savepath; t=plotting_t, fastforward=1.0, fps=20)

@@ -19,7 +19,7 @@
                     "id": 1,
                     "topic": "/target_data",
                     "data_point_size": 5,
-                    "data_points": 1
+                    "data_points": 8
                 }
             ],
             "publisher": [
