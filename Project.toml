@@ -1,7 +1,7 @@
 name = "VMRobotControl"
 uuid = "7d923390-5bb2-4b12-9c06-5b46ef7ec375"
-authors = ["Daniel Larby <dan_larby@hotmail.co.uk>"]
 version = "0.1.0"
+authors = ["Daniel Larby <dan_larby@hotmail.co.uk>"]
 
 [deps]
 BenchmarkTools = "6e4b80f9-dd63-53aa-95a3-0cdb28fa8baf"
@@ -44,7 +44,6 @@ VMRobotControlDifferentialEquationsExt = "DifferentialEquations"
 VMRobotControlMakieExt = "Makie"
 
 [compat]
-julia = "1.9"
 BenchmarkTools = "1"
 ColorTypes = "0.11, 0.12"
 Colors = "0.12, 0.13"
@@ -65,11 +64,12 @@ MeshIO = "0.4"
 Observables = "0.5"
 OrderedCollections = "1"
 Pkg = "1"
-PreallocationTools = "0.4"
+PreallocationTools = "0.4, 1"
 ResultTypes = "3, 4"
 SparseArrays = "1"
 StaticArrays = "1.8.1"
 StatsBase = "0.34"
+julia = "1.9"
 
 [extras]
 DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
